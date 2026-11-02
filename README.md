@@ -85,9 +85,22 @@ Current suites:
 - `PublicApiTest` — public C++/C API surface
 - `TwoByteOpcodeTest` — x64 `0x0F` two-byte subset
 - `NoOperandTest` — no-operand instruction semantics
+- `StackOperandTest` — stack-operand forms of ModR/M extension groups (x64 path)
+- `X64PrefixTest` — x64 prefix handling (REX, 66h/67h, multibyte NOP length corner cases)
 - `X87OpcodeTest` — x87 D8–DF core family (x64 path)
 - `X86BasicTest` — x86-32 basic 1-byte instructions via `Disasm<32>`
 - `X86TwoByteOpcodeTest` — x86-32 `0x0F` two-byte subset via `Disasm<32>`
+- `X86x87Test` — x87 D8–DF core family via `Disasm<32>`
+- `X86OpcodeExtTest` — x86-32 opcode extension groups
+- `X86PrefixTest` — legacy prefix combinations and 15-byte length limits (x86-32)
+- `X86OperandSizeTest` — 66h operand-size toggles (x86-32)
+- `X86AddrSizeTest` — 67h address-size overrides (x86-32)
+- `X86SegOverrideTest` — segment-override composite operands (x86-32)
+- `X86AamAadTest` — AAM/AAD immediate forms (x86-32)
+- `X86IncDecTest` — opcode-embedded INC/DEC (`0x40–0x4F`) as r32/r16 (x86-32)
+- `X86JccTest` — short/near Jcc forms (x86-32)
+- `X86NoOperandTest` — no-operand instruction semantics (x86-32)
+- `X86InvalidTest` — undefined/invalid instruction rejection (x86-32)
 - `SystemOpcodeTest` — system/privileged instruction decode paths (0F 00/01/18/1C/1E/20–23/C7)
 
 For latest totals/pass status, run `ctest --output-on-failure` in your build directory.
@@ -164,7 +177,7 @@ All decoders completed with `decoded=86009850`, `errors=0` on this corpus.
 ## Authorship
 
 - **Basic x64 instructions** — implemented by the project author (human).
-- **Remaining instruction families** (extended two-byte opcodes, x87, system/privileged, x86-32 path, SIMD subsets, etc.) — implemented with AI assistance (GitHub Copilot).
+- **Remaining instruction families** (extended two-byte opcodes, x87, system/privileged, x86-32 path, SIMD subsets, etc.) — implemented with AI assistance.
 
 ## References
 
