@@ -331,6 +331,30 @@ static constexpr std::array<const std::array<Operands, 256>*, 9> kOperandFormTab
     &kOperandFormTable_Gv_M
 } };
 
+// Flattened form tables indexed by (form_index * 256 + modrm), eliminating
+// the pointer indirection through kOperandFormTable_ModRM (one dependent
+// load less on the hot ModR/M path). Slots 0 and 5 have no table (nullptr
+// above); they are left as INVOPR and must be guarded at the call site to
+// preserve the "no table → no resolution" semantics.
+static constexpr std::array<Operands, 9 * 256> kOperandFormTable_ModRM_Flat = [] {
+    std::array<Operands, 9 * 256> flat{};
+    for (size_t i = 0; i < 256; ++i) {
+        for (size_t slot : { size_t{0}, size_t{5} }) {
+            flat[slot * 256 + i] = Operands{ { Operand::invalid, Operand::invalid,
+                                               Operand::invalid, Operand::invalid } };
+        }
+    }
+    for (size_t t = 0; t < kOperandFormTable_ModRM.size(); ++t) {
+        if (kOperandFormTable_ModRM[t] == nullptr) {
+            continue;
+        }
+        for (size_t i = 0; i < 256; ++i) {
+            flat[t * 256 + i] = (*kOperandFormTable_ModRM[t])[i];
+        }
+    }
+    return flat;
+}();
+
 static constexpr std::array<uint8_t, 256> kLengthTable_ModRM = { {
 /*     0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F */
 /*00*/ 2, 2, 2, 2, 3, 6, 2, 2, 2, 2, 2, 2, 3, 6, 2, 2,

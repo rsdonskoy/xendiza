@@ -125,6 +125,11 @@ class X64Traits {
 
     static inline auto ProcessPrefix(gsl::span<const uint8_t> buffer) noexcept -> std::pair<PrefixInfo, ErrorCode>;
     static auto Decode2ByteOpcode(const PrefixInfo& prefix_info, gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction;
+    // 1-byte opcode decode core, shared by the fast leaf dispatcher and the
+    // prefix-parsing slow path. Must stay free of calls (besides the cold
+    // 0x0F tail) so the no-prefix hot path compiles to a leaf function.
+    static auto Decode1Byte(const PrefixInfo& prefix_info, gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction;
+    static auto DecodeInstructionSlowPath(gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction;
     static auto DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction;
 
 public:

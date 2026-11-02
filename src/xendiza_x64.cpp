@@ -1,5 +1,16 @@
 #include <xendiza/xendiza_x64.hpp>
 
+#if defined(_MSC_VER)
+#define XENDIZA_FORCEINLINE __forceinline
+#define XENDIZA_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define XENDIZA_FORCEINLINE inline __attribute__((always_inline))
+#define XENDIZA_NOINLINE __attribute__((noinline))
+#else
+#define XENDIZA_FORCEINLINE inline
+#define XENDIZA_NOINLINE
+#endif
+
 namespace xendiza::detail {
 
 namespace {
@@ -287,17 +298,14 @@ auto X64Traits::Decode2ByteOpcode(
             }
         }
 
-        if (const auto form_index = static_cast<size_t>(resolved_id.operands.operand[0]);
-            form_index < kOperandFormTable_ModRM.size()) {
-            if (const auto* form_table = kOperandFormTable_ModRM[form_index];
-                form_table != nullptr) {
-                const auto& form = (*form_table)[modrm];
-                if (form.operand[0] == Operand::invalid) {
-                    return ERR_UNDEFINED_INSTRUCTION;
-                }
-                resolved_id.operands     = form;
-                resolved_id.operand_count = 2;
+        if (const auto form_index = static_cast<uint32_t>(resolved_id.operands.operand[0]);
+            form_index - 1 < 4 || form_index - 6 < 3) {
+            const auto& form = kOperandFormTable_ModRM_Flat[form_index * 256 + modrm];
+            if (form.operand[0] == Operand::invalid) {
+                return ERR_UNDEFINED_INSTRUCTION;
             }
+            resolved_id.operands     = form;
+            resolved_id.operand_count = 2;
         }
         // rm=100 (and mod!=11) → SIB byte follows; resolve stack markers. The
         // mandatory disp32 (SIB.base=101) only applies at mod=00.
@@ -1100,17 +1108,77 @@ auto X64Traits::Disasm(gsl::span<const uint8_t> buffer) noexcept -> DecodedInstr
     return result;
 }
 
-auto X64Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction
+// Builds the PrefixInfo for a single leading legacy/REX prefix byte, exactly
+// as ProcessPrefix would after consuming one byte (and stopping at a
+// following plain opcode or 0x0F escape). Callers must guarantee kind is a
+// legacy or REX prefix (VEX/EVEX excluded).
+constexpr auto PrefixInfoForSinglePrefix(const Prefix kind, const uint8_t byte) noexcept -> PrefixInfo
+{
+    PrefixInfo info{};
+    info.length = 1;
+    if (byte >= 0x40 && byte <= 0x4F) {
+        info.has_prefix.has_rex = 1;
+        info.rex_byte = byte;
+        return info;
+    }
+    switch (kind) {
+    case Prefix::LOCK:      info.has_prefix.has_lock = 1; break;
+    case Prefix::REPNE:
+    case Prefix::REPE:      info.has_prefix.has_rep = 1; info.rep_byte = byte; break;
+    case Prefix::ES_SEG:
+    case Prefix::CS_SEG:
+    case Prefix::SS_SEG:
+    case Prefix::DS_SEG:
+    case Prefix::FS_SEG:
+    case Prefix::GS_SEG:    info.has_prefix.has_seg = 1; info.seg_byte = byte; break;
+    case Prefix::OPR_SIZE:  info.has_prefix.has_66 = 1; break;
+    case Prefix::ADDR_SIZE: info.has_prefix.has_67 = 1; break;
+    default: break;
+    }
+    return info;
+}
+
+XENDIZA_NOINLINE
+auto X64Traits::DecodeInstructionSlowPath(gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction
 {
     if (buffer.empty()) {
         return ERR_INSUFFICIENT_BUFFER;
     }
-
     const auto [prefix_info, prefix_error] = ProcessPrefix(buffer);
     if (prefix_error != ErrorCode::OK) {
         return ToErrorInstruction(prefix_error);
     }
+    return Decode1Byte(prefix_info, buffer);
+}
 
+auto X64Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction
+{
+    // Leaf fast path: decode without calling ProcessPrefix whenever the
+    // prefix shape is "zero or one legacy/REX prefix, then a plain opcode or
+    // the 0x0F escape" — the overwhelmingly common shape in real x86-64
+    // code (including REX-prefixed and 66h/F3-prefixed forms). Stacked
+    // prefixes, VEX/EVEX, and empty/tiny buffers take the slow path.
+    if (!buffer.empty()) {
+        const auto first_kind = X64Traits::kPrefixTable[buffer[0]];
+        if (first_kind == Prefix::NONE || first_kind == Prefix::OPC_2BYTE) {
+            return Decode1Byte(PrefixInfo{}, buffer);
+        }
+        if (buffer.size() >= 2) {
+            const auto second_kind = X64Traits::kPrefixTable[buffer[1]];
+            if ((second_kind == Prefix::NONE || second_kind == Prefix::OPC_2BYTE)
+                && first_kind != Prefix::VEX_2BYTE
+                && first_kind != Prefix::VEX_3BYTE
+                && first_kind != Prefix::EVEX) {
+                return Decode1Byte(PrefixInfoForSinglePrefix(first_kind, buffer[0]), buffer);
+            }
+        }
+    }
+    return DecodeInstructionSlowPath(buffer);
+}
+
+XENDIZA_FORCEINLINE
+auto X64Traits::Decode1Byte(const PrefixInfo& prefix_info, gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction
+{
     if (buffer.size() <= prefix_info.length) {
         return ERR_UNDEFINED_INSTRUCTION;
     }
@@ -1143,17 +1211,16 @@ auto X64Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> D
         }
 
         auto resolved_id = instr_id;
-        const auto form_index = static_cast<size_t>(resolved_id.operands.operand[0]);
-        if (form_index < kOperandFormTable_ModRM.size()) {
-            const auto* form_table = kOperandFormTable_ModRM[form_index];
-            if (form_table != nullptr) {
-                const auto& form = (*form_table)[modrm];
-                if (form.operand[0] == Operand::invalid) {
-                    return ERR_UNDEFINED_INSTRUCTION;
-                }
-                resolved_id.operands = form;
-                resolved_id.operand_count = 2;
+        const auto form_index = static_cast<uint32_t>(resolved_id.operands.operand[0]);
+        // Valid tables sit at slots 1-4 and 6-8 (0 and 5 are nullptr above);
+        // any other marker value leaves the operands untouched.
+        if (form_index - 1 < 4 || form_index - 6 < 3) {
+            const auto& form = kOperandFormTable_ModRM_Flat[form_index * 256 + modrm];
+            if (form.operand[0] == Operand::invalid) {
+                return ERR_UNDEFINED_INSTRUCTION;
             }
+            resolved_id.operands = form;
+            resolved_id.operand_count = 2;
         }
 
         // Resolve SIB-dispatch markers (m* vs stack_m*) before size fixups.
@@ -1161,8 +1228,17 @@ auto X64Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> D
             resolved_id = ResolveSibMarkers(resolved_id, sib);
         }
 
-        const auto adjusted = ApplyPrefixSizes({ modrm_len, resolved_id }, prefix_info);
-        return { static_cast<uint8_t>(prefix_info.length + adjusted.length), adjusted.instrId };
+        DecodedInstruction out;
+        if (!prefix_info.has_prefix.HasOverriding()) {
+            // No 66h/67h/segment/REX prefix: ApplyPrefixSizes is a no-op
+            // (LOCK/REP prefixes never reach its fixups), so skip the call
+            // and the DecodedInstruction copy entirely.
+            out = { static_cast<uint8_t>(prefix_info.length + modrm_len), resolved_id };
+        } else {
+            out = ApplyPrefixSizes({ modrm_len, resolved_id }, prefix_info);
+            out.length = static_cast<uint8_t>(prefix_info.length + out.length);
+        }
+        return out;
     }
 
     // length depends on ModR/M and includes a 1-byte immediate
