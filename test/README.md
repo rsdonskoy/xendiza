@@ -228,8 +228,10 @@ Differential testing against capstone/zydis vectors (`test/diff/`) surfaced two 
 
 ## Performance Regression Guard
 
-`test/test_perf_regression.cpp` adds a ctest-registered throughput guard for the
-64-bit decode hot path (`xendiza::Disasm<64>`).
+`test/test_perf_regression.cpp` adds two ctest-registered throughput guards
+for the 64-bit decode hot path (`xendiza::Disasm<64>`): an absolute floor
+(`ThroughputGuard`) and a machine-independent ratio against a naive reference
+decoder (`RelativeThroughputGuard`).
 
 ### What it measures
 
@@ -250,43 +252,74 @@ the compiler from eliding the decode loop.
 
 ### Throughput floor
 
-The default floor is **25 MiB/s**, roughly 40% of the 61.41 MiB/s Release
+The default floor is **35 MiB/s**, roughly 57% of the 61.41 MiB/s Release
 baseline recorded in `bench/README.md` for the synthetic seed (8 MiB, 40
 iterations). The margin is intentionally loose to avoid flaky failures on noisy
 dev machines or CI runners while still catching order-of-magnitude regressions
 (allocation in the hot path, an extra prefix pass, a rescan per instruction, etc.).
 
-On the baseline-class machine the guard actually measures ~67–68 MiB/s in
-Release, so the floor is comfortable.
+On the baseline-class machine the guard actually measures ~65–68 MiB/s in
+Release, so the floor keeps ~2x headroom.
+
+### Relative guard (machine-independent)
+
+`RelativeThroughputGuard` removes the machine dependence entirely. It sweeps the
+same corpus with a deliberately naive reference decoder (prefix walk + plain
+switch + sequential ModR/M sizing, covering exactly the seed's opcode subset)
+and asserts that xendiza's best-of-5 throughput stays above a fixed fraction of
+the naive decoder's best-of-5 throughput, measured in the same run. Since both
+decoders slow down together on a slower machine, their **ratio** is a stable,
+machine-independent signal — the baseline calibrates itself on whatever machine
+runs it.
+
+On the baseline-class machine the measured ratio is ~0.085 (xendiza ~65 MiB/s
+vs naive ~770 MiB/s); the default floor **0.05** leaves ~40% headroom for
+cross-machine ratio drift and catches regressions of roughly 2x or worse,
+complementing the absolute floor. Before the ratio assertion, the test asserts
+the naive decoder lands on exactly the same instruction boundaries (same
+decoded count, full byte coverage), so the comparison is always like-for-like.
+
+Note for future ISA coverage: the naive reference only knows the opcode subset
+in `kSeed`. When adding new instruction families (SSE `0F` map, AVX2/VEX, …),
+extend `NaiveDecodeLength` alongside the library and the seed corpus, then
+re-derive the constants from a Release run.
 
 ### Environment override
 
-Set `XENDIZA_PERF_MIN_MIBS` to override the default floor with a positive double:
+Set `XENDIZA_PERF_MIN_MIBS` to override the default MiB/s floor, and
+`XENDIZA_PERF_MIN_RATIO` to override the default xendiza/naive ratio floor,
+each with a positive double:
 
 ```bash
-# Relax the gate for a slow CI runner
+# Relax the gates for a slow CI runner
 XENDIZA_PERF_MIN_MIBS=10 ctest -R PerfRegression
 
-# Tighten it for a local Release gate
-XENDIZA_PERF_MIN_MIBS=50 ctest -R PerfRegression
+# Tighten them for a local Release gate
+XENDIZA_PERF_MIN_MIBS=50 XENDIZA_PERF_MIN_RATIO=0.07 ctest -R PerfRegression
 ```
 
-Invalid or non-positive values fall back to the default.
+Invalid or non-positive values fall back to the defaults.
 
 ### Debug builds
 
-The test body begins with `#ifndef NDEBUG → GTEST_SKIP()`. Debug timings are not
-comparable to the Release baseline, so the guard does not run in Debug builds.
+Both test bodies begin with `#ifndef NDEBUG → GTEST_SKIP()`. Debug timings are
+not comparable to the Release baseline, so the guards do not run in Debug
+builds.
 
 ### Re-calibration
 
 If the Release baseline changes significantly:
 
 1. Build Release and run `xendiza_bench --mb 8 --iters 40`.
-2. Multiply the reported xendiza MiB/s by a safety factor (e.g. 0.4).
+2. Set the floor to ~50–60% of the reported xendiza MiB/s.
 3. Update `kDefaultMinMiBPerSec` in `test/test_perf_regression.cpp` and this
    section, then re-run `ctest -R PerfRegression` to confirm it still passes
    comfortably.
+
+The relative guard's ratio floor only needs re-calibration when the corpus or
+`NaiveDecodeLength` changes: read the measured ratio from a failing run (set
+`XENDIZA_PERF_MIN_RATIO` above the real value and the failure message prints
+it), then set `kDefaultMinRatio` to ~50–60% of it.
 
 ---
 

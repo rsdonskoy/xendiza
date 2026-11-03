@@ -87,6 +87,10 @@ auto ParseOptions(const int argc, char** argv) -> Options
 auto BuildCorpus(const size_t min_bytes) -> std::vector<uint8_t>
 {
     // Supported 1-byte opcodes with mixed ModRM, immediates, prefixes.
+    // NOTE: only 77 bytes are listed explicitly; the std::array<79>
+    // zero-fills the final two, which decode as one extra `add m8, r8`
+    // (0x00 0x00) — the effective tile is 27 instructions, not 26. Keep this
+    // literal byte-identical with kSeed in test/test_perf_regression.cpp.
     static constexpr std::array<uint8_t, 79> kSeed = {
         0x00, 0xC3,                   // add r8, r8
         0x00, 0x00,                   // add m8, r8

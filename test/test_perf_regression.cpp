@@ -66,6 +66,14 @@ auto BuildCorpus(const size_t min_bytes) -> std::vector<uint8_t>
     return corpus;
 }
 
+// Known constants for the 79-byte seed tiled until >= 1 MiB (corpus size =
+// 1,048,646 bytes), derived from an actual Release run of this suite. They pin
+// the correctness of the decode loops so a throughput gate cannot be passed by
+// wrong results or by the compiler eliding the work. If kSeed changes,
+// re-derive them from a Release run.
+constexpr uint64_t kExpectedDecoded = 358398;
+constexpr uint64_t kExpectedChecksum = 1619428;
+
 // Returns the best MiB/s across the timed iterations, and fills `decoded` and
 // `checksum` with the values observed during the run.
 auto MeasureThroughput(const std::vector<uint8_t>& corpus, uint32_t warmup_iters, uint32_t timed_iters,
@@ -113,16 +121,163 @@ auto MeasureThroughput(const std::vector<uint8_t>& corpus, uint32_t warmup_iters
     return best_mibs;
 }
 
-// Default floor is ~40% of the 61.41 MiB/s Release baseline recorded in
-// bench/README.md for the synthetic seed (8 MiB, 40 iterations).
-// To re-calibrate: build Release, run `xendiza_bench --mb 8 --iters 40`,
-// multiply the reported xendiza MiB/s by a safety factor (e.g. 0.4), and update
-// this constant. Override at runtime with XENDIZA_PERF_MIN_MIBS.
-static constexpr double kDefaultMinMiBPerSec = 25.0;
-
-auto GetMinMiBPerSec() -> double
+// Deliberately naive reference decoder covering exactly the opcode subset that
+// appears in kSeed: a prefix walk + a plain switch + sequential ModR/M sizing.
+// No decode tables, no operand metadata. Its cost scales with the machine just
+// like the library's, so the xendiza/naive throughput ratio is
+// machine-independent — this is the self-calibrating baseline for the relative
+// guard: a library regression shows up as a ratio drop on any machine,
+// regardless of that machine's absolute speed.
+//
+// Returns the instruction length (prefix bytes included), or 0xE0 (mirroring
+// the library's error encoding) for opcodes outside the seed subset or
+// truncated input.
+auto NaiveDecodeLength(const gsl::span<const uint8_t> code) -> unsigned
 {
-    const char* env = std::getenv("XENDIZA_PERF_MIN_MIBS");
+    size_t i = 0;
+    bool rex_w = false;
+    bool op66 = false;
+    while (i < code.size() && (code[i] == 0x48 || code[i] == 0x66)) {
+        rex_w = rex_w || code[i] == 0x48;
+        op66 = op66 || code[i] == 0x66;
+        ++i;
+    }
+    if (i >= code.size()) {
+        return 0xE0;
+    }
+
+    const uint8_t op = code[i];
+    ++i;
+
+    bool has_modrm = false;
+    unsigned imm = 0;
+    switch (op) {
+    case 0x00: case 0x01: case 0x03: case 0x08:
+    case 0x20: case 0x28: case 0x30: case 0x38:
+    case 0x84: case 0x89: case 0x8D:
+        has_modrm = true;
+        break;
+    case 0x04: case 0x6A: case 0x70: case 0xEB:
+        imm = 1;
+        break;
+    case 0x05:
+        imm = (op66 && !rex_w) ? 2 : 4;
+        break;
+    case 0x81:
+        imm = (op66 && !rex_w) ? 2 : 4;
+        has_modrm = true;
+        break;
+    case 0x83:
+        imm = 1;
+        has_modrm = true;
+        break;
+    case 0xB8:
+        imm = rex_w ? 8 : 4;
+        break;
+    case 0xE8: case 0xE9:
+        imm = 4;
+        break;
+    case 0x90: case 0xC3: case 0xF4:
+        break;
+    default:
+        return 0xE0;
+    }
+
+    unsigned len = i; // prefix bytes + opcode byte
+    if (has_modrm) {
+        if (i >= code.size()) {
+            return 0xE0;
+        }
+        const uint8_t modrm = code[i];
+        ++len;
+        const unsigned mod = modrm >> 6;
+        const unsigned rm = modrm & 7;
+        if (mod != 3) {
+            if (rm == 4) { // SIB byte follows
+                if (i + 1 >= code.size()) {
+                    return 0xE0;
+                }
+                const uint8_t sib = code[i + 1];
+                ++len;
+                if (mod == 0 && (sib & 7) == 5) {
+                    len += 4; // SIB base=disp32
+                }
+            } else if (mod == 0 && rm == 5) {
+                len += 4; // RIP-relative disp32
+            }
+            if (mod == 1) {
+                len += 1; // disp8
+            } else if (mod == 2) {
+                len += 4; // disp32
+            }
+        }
+    }
+    return len + imm;
+}
+
+// Same best-of-N protocol as MeasureThroughput, but sweeping with the naive
+// reference decoder. Only decoded count and covered bytes are accumulated (the
+// naive decoder produces no operand metadata); the loop cannot be elided
+// because each returned length drives the sweep offset.
+auto MeasureReferenceThroughput(const std::vector<uint8_t>& corpus, uint32_t warmup_iters,
+                                uint32_t timed_iters, uint64_t& decoded, uint64_t& covered) -> double
+{
+    decoded = 0;
+    covered = 0;
+
+    auto run_once = [&]() -> double {
+        uint64_t local_decoded = 0;
+        uint64_t local_covered = 0;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t off = 0;
+        while (off < corpus.size()) {
+            auto span = gsl::span<const uint8_t>(corpus.data() + off, corpus.size() - off);
+            const unsigned len = NaiveDecodeLength(span);
+            if (len >= 0xE0 || len == 0) {
+                ++off; // resync, mirrors the library sweep
+                continue;
+            }
+            ++local_decoded;
+            local_covered += len;
+            off += len;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+
+        decoded = local_decoded;
+        covered = local_covered;
+
+        const double seconds = std::chrono::duration<double>(t1 - t0).count();
+        const double mib = static_cast<double>(corpus.size()) / (1024.0 * 1024.0);
+        return (seconds > 0.0) ? (mib / seconds) : 0.0;
+    };
+
+    for (uint32_t i = 0; i < warmup_iters; ++i) {
+        run_once();
+    }
+
+    double best_mibs = 0.0;
+    for (uint32_t i = 0; i < timed_iters; ++i) {
+        best_mibs = std::max(best_mibs, run_once());
+    }
+    return best_mibs;
+}
+
+// Default floor is ~57% of the 61.41 MiB/s Release baseline recorded in
+// bench/README.md for the synthetic seed (8 MiB, 40 iterations). The guard
+// measures ~67–68 MiB/s on the baseline-class machine, so the floor keeps
+// ~2x headroom while still catching order-of-magnitude regressions.
+// To re-calibrate: build Release, run `xendiza_bench --mb 8 --iters 40`,
+// set the floor to ~50–60% of the reported xendiza MiB/s, and update this
+// constant. Override at runtime with XENDIZA_PERF_MIN_MIBS.
+static constexpr double kDefaultMinMiBPerSec = 35.0;
+
+// Returns a positive double from the environment variable `name`, or
+// `fallback` when the variable is unset, empty, non-numeric, non-positive,
+// or out of range.
+auto GetEnvPositiveDouble(const char* name, const double fallback) -> double
+{
+    const char* env = std::getenv(name);
     if (env != nullptr && env[0] != '\0') {
         char* end = nullptr;
         const double value = std::strtod(env, &end);
@@ -130,7 +285,7 @@ auto GetMinMiBPerSec() -> double
             return value;
         }
     }
-    return kDefaultMinMiBPerSec;
+    return fallback;
 }
 
 } // namespace
@@ -152,20 +307,60 @@ TEST(PerfRegression, ThroughputGuard)
     uint64_t checksum = 0;
     const double best_mibs = MeasureThroughput(corpus, kWarmupIters, kTimedIters, decoded, checksum);
 
-    // Known constants for the 79-byte seed tiled until >= 1 MiB
-    // (corpus size = 1,048,646 bytes). These were derived from an actual
-    // Release run of this test and pin the correctness of the decode loop so
-    // the throughput gate cannot be passed by wrong results or by the compiler
-    // eliding the work. If kSeed changes, re-derive them from a Release run.
-    constexpr uint64_t kExpectedDecoded = 358398;
-    constexpr uint64_t kExpectedChecksum = 1619428;
+    EXPECT_EQ(decoded, kExpectedDecoded)
+        << "Decoded-instruction count changed; the perf measurement may be invalid";
+    EXPECT_EQ(checksum, kExpectedChecksum)
+        << "Decode checksum changed; lengths or operand counts may be wrong";
+
+    const double min_mibs = GetEnvPositiveDouble("XENDIZA_PERF_MIN_MIBS", kDefaultMinMiBPerSec);
+    EXPECT_GE(best_mibs, min_mibs)
+        << "Throughput " << best_mibs << " MiB/s is below the floor " << min_mibs << " MiB/s";
+}
+
+// Default floor for the xendiza/naive throughput ratio (see
+// RelativeThroughputGuard). The ratio is machine-independent (both decoders
+// are measured in the same run), so no per-machine re-calibration is needed.
+// Calibrated from an actual Release run on the baseline-class machine:
+// measured ratio ~0.085 (xendiza ~65 MiB/s vs naive ~770 MiB/s on the seed
+// corpus); the floor at 0.05 leaves ~40% headroom for cross-machine ratio
+// drift while catching ~2x regressions. Override with XENDIZA_PERF_MIN_RATIO.
+static constexpr double kDefaultMinRatio = 0.05;
+
+TEST(PerfRegression, RelativeThroughputGuard)
+{
+#ifndef NDEBUG
+    GTEST_SKIP() << "Performance regression guard is skipped in Debug builds";
+#endif
+
+    const auto corpus = BuildCorpus(1024 * 1024);
+
+    constexpr uint32_t kWarmupIters = 1;
+    constexpr uint32_t kTimedIters = 5;
+
+    uint64_t decoded = 0;
+    uint64_t checksum = 0;
+    const double xendiza_mibs = MeasureThroughput(corpus, kWarmupIters, kTimedIters, decoded, checksum);
 
     EXPECT_EQ(decoded, kExpectedDecoded)
         << "Decoded-instruction count changed; the perf measurement may be invalid";
     EXPECT_EQ(checksum, kExpectedChecksum)
         << "Decode checksum changed; lengths or operand counts may be wrong";
 
-    const double min_mibs = GetMinMiBPerSec();
-    EXPECT_GE(best_mibs, min_mibs)
-        << "Throughput " << best_mibs << " MiB/s is below the floor " << min_mibs << " MiB/s";
+    uint64_t ref_decoded = 0;
+    uint64_t ref_covered = 0;
+    const double ref_mibs = MeasureReferenceThroughput(corpus, kWarmupIters, kTimedIters,
+                                                       ref_decoded, ref_covered);
+
+    // The naive baseline must land on exactly the same instruction boundaries
+    // with zero resync; otherwise the ratio is comparing different work.
+    EXPECT_EQ(ref_decoded, kExpectedDecoded)
+        << "Naive reference decoded a different instruction count; the ratio is meaningless";
+    EXPECT_EQ(ref_covered, static_cast<uint64_t>(corpus.size()))
+        << "Naive reference did not cover the corpus exactly; the ratio is meaningless";
+
+    const double ratio = (ref_mibs > 0.0) ? xendiza_mibs / ref_mibs : 0.0;
+    const double min_ratio = GetEnvPositiveDouble("XENDIZA_PERF_MIN_RATIO", kDefaultMinRatio);
+    EXPECT_GE(ratio, min_ratio)
+        << "xendiza/naive ratio " << ratio << " (xendiza " << xendiza_mibs
+        << " MiB/s, naive " << ref_mibs << " MiB/s) is below the floor " << min_ratio;
 }
