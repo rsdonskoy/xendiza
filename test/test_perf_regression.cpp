@@ -54,25 +54,70 @@ static constexpr std::array<uint8_t, 79> kSeed = {
     0x00, 0x00                    // implicit zero-fill decodes as add m8, r8
 };
 
-// Tile the seed until the corpus is at least `min_bytes` long, matching the
-// BuildCorpus() logic in bench/bench_disasm.cpp exactly.
+// Representative 0F two-byte and x87 sequences, added so the guards also
+// cover the two-byte escape dispatch (Decode2ByteOpcode) and the x87
+// descriptor path — not just the 1-byte legacy map. Every sequence here is
+// drawn from opcodes covered by test/test_2byte_opcodes.cpp and
+// test/test_x86_x87_opcodes.cpp (and their 32-bit twins), so the sweep stays
+// on the zero-error decode path. Test-only: the bench keeps the legacy tile.
+//
+// When adding ISA families (more SSE forms, AVX2/VEX, ...), extend this tile
+// AND NaiveDecodeLength's opcode subset in the same change, then re-derive
+// the constants below from a Release run. The initializer must list exactly
+// 68 bytes: std::array zero-fill would silently append decodable bytes — the
+// same trap as the original bench kSeed (see the note above).
+static constexpr std::array<uint8_t, 68> kSeedExt = {
+    // 0F two-byte map
+    0x0F, 0x05,                         // syscall
+    0x0F, 0x31,                         // rdtsc
+    0x0F, 0xA2,                         // cpuid
+    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00, // jz rel32
+    0x0F, 0x90, 0x00,                   // seto m8      ([rax])
+    0x0F, 0x95, 0xC0,                   // setnz r8
+    0x0F, 0xB6, 0xC3,                   // movzx r32, r8
+    0x0F, 0xB6, 0x00,                   // movzx r32, m8 ([rax])
+    0x0F, 0xAF, 0xC3,                   // imul r32, r32
+    0x0F, 0xBA, 0xE0, 0x04,             // bt r32, imm8
+    0x0F, 0xC8,                         // bswap eax
+    0x0F, 0x1F, 0x00,                   // nop m        ([rax])
+    0x0F, 0x58, 0xC3,                   // addps xmm, xmm
+    0x0F, 0x58, 0x00,                   // addps xmm, m  ([rax])
+    0x66, 0x0F, 0x58, 0x00,             // addpd xmm, m  ([rax])
+    0xF3, 0x0F, 0x58, 0x00,             // addss xmm, m  ([rax])
+    // x87 D8-DF
+    0xD8, 0x00,                         // fadd m32fp   ([rax])
+    0xD8, 0xC1,                         // fadd st0, st1
+    0xD9, 0x00,                         // fld  m32fp   ([rax])
+    0xD9, 0xC1,                         // fld  st1
+    0xD9, 0xD0,                         // fnop
+    0xD9, 0xE0,                         // fchs
+    0xDB, 0x28,                         // fld  m80fp   ([rax])
+    0xDD, 0x30,                         // fsave m      ([rax])
+    0xDF, 0xE0,                         // fnstsw ax
+};
+
+// Tile the legacy seed + extension until the corpus is at least `min_bytes`
+// long. One pattern period is kSeed.size() + kSeedExt.size() bytes, so the
+// sweep stays periodically aligned.
 auto BuildCorpus(const size_t min_bytes) -> std::vector<uint8_t>
 {
     std::vector<uint8_t> corpus;
     corpus.reserve(min_bytes);
     while (corpus.size() < min_bytes) {
         corpus.insert(corpus.end(), kSeed.begin(), kSeed.end());
+        corpus.insert(corpus.end(), kSeedExt.begin(), kSeedExt.end());
     }
     return corpus;
 }
 
-// Known constants for the 79-byte seed tiled until >= 1 MiB (corpus size =
-// 1,048,646 bytes), derived from an actual Release run of this suite. They pin
+// Known constants for the corpus (legacy 79-byte tile + 68-byte 0F/x87
+// extension, pattern period 147 bytes) tiled until >= 1 MiB (corpus size =
+// 1,048,698 bytes), derived from an actual Release run of this suite. They pin
 // the correctness of the decode loops so a throughput gate cannot be passed by
-// wrong results or by the compiler eliding the work. If kSeed changes,
-// re-derive them from a Release run.
-constexpr uint64_t kExpectedDecoded = 358398;
-constexpr uint64_t kExpectedChecksum = 1619428;
+// wrong results or by the compiler eliding the work. If kSeed or kSeedExt
+// changes, re-derive them from a Release run.
+constexpr uint64_t kExpectedDecoded = 370968;
+constexpr uint64_t kExpectedChecksum = 1569480;
 
 // Returns the best MiB/s across the timed iterations, and fills `decoded` and
 // `checksum` with the values observed during the run.
@@ -137,7 +182,8 @@ auto NaiveDecodeLength(const gsl::span<const uint8_t> code) -> unsigned
     size_t i = 0;
     bool rex_w = false;
     bool op66 = false;
-    while (i < code.size() && (code[i] == 0x48 || code[i] == 0x66)) {
+    while (i < code.size() &&
+           (code[i] == 0x48 || code[i] == 0x66 || code[i] == 0xF2 || code[i] == 0xF3)) {
         rex_w = rex_w || code[i] == 0x48;
         op66 = op66 || code[i] == 0x66;
         ++i;
@@ -146,12 +192,55 @@ auto NaiveDecodeLength(const gsl::span<const uint8_t> code) -> unsigned
         return 0xE0;
     }
 
-    const uint8_t op = code[i];
+    uint8_t op = code[i];
     ++i;
 
     bool has_modrm = false;
     unsigned imm = 0;
-    switch (op) {
+
+    if (op == 0x0F) {
+        // Two-byte escape. Only the subset present in kSeedExt is sized; any
+        // other second opcode is reported as undefined, mirroring the
+        // library sweep's resync on uncovered opcodes.
+        if (i >= code.size()) {
+            return 0xE0;
+        }
+        const uint8_t op2 = code[i];
+        ++i;
+        switch (op2) {
+        case 0x05: case 0x31: case 0xA2: // syscall, rdtsc, cpuid
+            break;
+        case 0x84:                       // Jcc rel32 (0F 80-8F)
+            imm = 4;
+            break;
+        case 0x90: case 0x91: case 0x92: case 0x93: // SETcc r/m8
+        case 0x94: case 0x95: case 0x96: case 0x97:
+        case 0x98: case 0x99: case 0x9A: case 0x9B:
+        case 0x9C: case 0x9D: case 0x9E: case 0x9F:
+        case 0x1F:                       // multi-byte NOP r/m
+        case 0x2E: case 0x2F:            // ucomiss/ucomisd
+        case 0x58: case 0x5C:            // addps/addpd, subps/subpd
+        case 0xAF:                       // imul r, r/m
+        case 0xB6: case 0xB7:            // movzx
+        case 0xBE: case 0xBF:            // movsx
+        case 0xA3: case 0xAB: case 0xB3: case 0xBB: // BT/BTS/BTR/BTC
+            has_modrm = true;
+            break;
+        case 0xBA:                       // group 8: r/m, imm8
+            imm = 1;
+            has_modrm = true;
+            break;
+        case 0xC8: case 0xC9: case 0xCA: case 0xCB: // bswap r32
+        case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+            break;
+        default:
+            return 0xE0;
+        }
+    } else if (op >= 0xD8 && op <= 0xDF) {
+        // x87: every form in D8-DF takes a ModR/M (register or memory).
+        has_modrm = true;
+    } else {
+        switch (op) {
     case 0x00: case 0x01: case 0x03: case 0x08:
     case 0x20: case 0x28: case 0x30: case 0x38:
     case 0x84: case 0x89: case 0x8D:
@@ -181,6 +270,7 @@ auto NaiveDecodeLength(const gsl::span<const uint8_t> code) -> unsigned
         break;
     default:
         return 0xE0;
+    }
     }
 
     unsigned len = i; // prefix bytes + opcode byte
@@ -263,13 +353,14 @@ auto MeasureReferenceThroughput(const std::vector<uint8_t>& corpus, uint32_t war
     return best_mibs;
 }
 
-// Default floor is ~57% of the 61.41 MiB/s Release baseline recorded in
-// bench/README.md for the synthetic seed (8 MiB, 40 iterations). The guard
-// measures ~67–68 MiB/s on the baseline-class machine, so the floor keeps
-// ~2x headroom while still catching order-of-magnitude regressions.
-// To re-calibrate: build Release, run `xendiza_bench --mb 8 --iters 40`,
-// set the floor to ~50–60% of the reported xendiza MiB/s, and update this
-// constant. Override at runtime with XENDIZA_PERF_MIN_MIBS.
+// Default floor for the absolute throughput guard. The corpus now mixes the
+// legacy tile with 0F/x87 sequences; on the baseline-class machine the guard
+// measures ~61–67 MiB/s in Release, so 35 MiB/s keeps ~2x headroom while
+// catching order-of-magnitude regressions. (The 61.41 MiB/s figure in
+// bench/README.md describes the legacy-only 8 MiB bench corpus.)
+// To re-calibrate: build Release, run this guard with XENDIZA_PERF_MIN_MIBS
+// set above the measured value to read the actual MiB/s from the failure
+// message, then set the floor to ~50–60% of it.
 static constexpr double kDefaultMinMiBPerSec = 35.0;
 
 // Returns a positive double from the environment variable `name`, or
@@ -321,10 +412,11 @@ TEST(PerfRegression, ThroughputGuard)
 // RelativeThroughputGuard). The ratio is machine-independent (both decoders
 // are measured in the same run), so no per-machine re-calibration is needed.
 // Calibrated from an actual Release run on the baseline-class machine:
-// measured ratio ~0.085 (xendiza ~65 MiB/s vs naive ~770 MiB/s on the seed
-// corpus); the floor at 0.05 leaves ~40% headroom for cross-machine ratio
-// drift while catching ~2x regressions. Override with XENDIZA_PERF_MIN_RATIO.
-static constexpr double kDefaultMinRatio = 0.05;
+// measured ratio ~0.11 (xendiza ~62–67 MiB/s vs naive ~610 MiB/s on the
+// extended corpus); the floor at 0.055 leaves ~50% headroom for cross-machine
+// ratio drift while catching ~2x regressions. Override with
+// XENDIZA_PERF_MIN_RATIO.
+static constexpr double kDefaultMinRatio = 0.055;
 
 TEST(PerfRegression, RelativeThroughputGuard)
 {
@@ -364,3 +456,4 @@ TEST(PerfRegression, RelativeThroughputGuard)
         << "xendiza/naive ratio " << ratio << " (xendiza " << xendiza_mibs
         << " MiB/s, naive " << ref_mibs << " MiB/s) is below the floor " << min_ratio;
 }
+

@@ -235,54 +235,61 @@ decoder (`RelativeThroughputGuard`).
 
 ### What it measures
 
-The guard uses the same deterministic synthetic corpus as `bench/bench_disasm.cpp`:
-the 79-byte legacy-opcode seed tile (ModR/M, SIB, immediates, and prefixes) tiled
-until it is at least 1 MiB long. The measurement loop is identical to the bench:
-linear `Disasm<64>` sweep, advancing by `di.length`, with 1 warmup iteration
-followed by 5 timed iterations. The best MiB/s across the 5 timed iterations is
-taken as the result, because environmental noise only ever slows a run.
+The guard uses a deterministic synthetic corpus: the 79-byte legacy seed tile
+from `bench/bench_disasm.cpp` (ModR/M, SIB, immediates, and prefixes — the
+literal lists 77 bytes; the `std::array<79>` zero-fill completes it with one
+more `add m8, r8`) plus a 68-byte extension tile of representative `0F`
+two-byte sequences (Jcc, SETcc, MOVZX, BT group, BSWAP, multi-byte NOP, SSE
+scalar/packed with `66`/`F3` prefixes) and x87 `D8–DF` sequences, tiled
+together to ~1 MiB. The extension puts the two-byte escape dispatch and the
+x87 descriptor path inside the measured loop, next to the 1-byte legacy map.
+The measurement loop is identical to the bench: linear `Disasm<64>` sweep,
+advancing by `di.length`, with 1 warmup iteration followed by 5 timed
+iterations. The best MiB/s across the 5 timed iterations is taken as the
+result, because environmental noise only ever slows a run.
 
 Before the throughput assertion, the test asserts two correctness constants:
 
-- `decoded` = 358,398 instructions per iteration
-- `checksum` = 1,619,428 (sum of `di.length + di.instrId.operand_count` per instruction)
+- `decoded` = 370,968 instructions per iteration
+- `checksum` = 1,569,480 (sum of `di.length + di.instrId.operand_count` per instruction)
 
 These prevent a "faster but wrong" optimization from passing the gate and stop
 the compiler from eliding the decode loop.
 
 ### Throughput floor
 
-The default floor is **35 MiB/s**, roughly 57% of the 61.41 MiB/s Release
-baseline recorded in `bench/README.md` for the synthetic seed (8 MiB, 40
-iterations). The margin is intentionally loose to avoid flaky failures on noisy
-dev machines or CI runners while still catching order-of-magnitude regressions
-(allocation in the hot path, an extra prefix pass, a rescan per instruction, etc.).
-
-On the baseline-class machine the guard actually measures ~65–68 MiB/s in
-Release, so the floor keeps ~2x headroom.
+The default floor is **35 MiB/s**. On the baseline-class machine the guard
+measures ~61–67 MiB/s in Release on the extended corpus, so the floor keeps
+~2x headroom. The margin is intentionally loose to avoid flaky failures on
+noisy dev machines or CI runners while still catching order-of-magnitude
+regressions (allocation in the hot path, an extra prefix pass, a rescan per
+instruction, etc.). (The 61.41 MiB/s figure in `bench/README.md` describes
+the legacy-only 8 MiB bench corpus; the two no longer measure identical
+workloads.)
 
 ### Relative guard (machine-independent)
 
 `RelativeThroughputGuard` removes the machine dependence entirely. It sweeps the
 same corpus with a deliberately naive reference decoder (prefix walk + plain
-switch + sequential ModR/M sizing, covering exactly the seed's opcode subset)
-and asserts that xendiza's best-of-5 throughput stays above a fixed fraction of
-the naive decoder's best-of-5 throughput, measured in the same run. Since both
-decoders slow down together on a slower machine, their **ratio** is a stable,
+switch + sequential ModR/M sizing, covering exactly the corpus's opcode subset:
+1-byte legacy map, the `0F` forms above, and x87 `D8–DF`) and asserts that
+xendiza's best-of-5 throughput stays above a fixed fraction of the naive
+decoder's best-of-5 throughput, measured in the same run. Since both decoders
+slow down together on a slower machine, their **ratio** is a stable,
 machine-independent signal — the baseline calibrates itself on whatever machine
 runs it.
 
-On the baseline-class machine the measured ratio is ~0.085 (xendiza ~65 MiB/s
-vs naive ~770 MiB/s); the default floor **0.05** leaves ~40% headroom for
-cross-machine ratio drift and catches regressions of roughly 2x or worse,
+On the baseline-class machine the measured ratio is ~0.11 (xendiza ~62–67
+MiB/s vs naive ~610 MiB/s); the default floor **0.055** leaves ~50% headroom
+for cross-machine ratio drift and catches regressions of roughly 2x or worse,
 complementing the absolute floor. Before the ratio assertion, the test asserts
 the naive decoder lands on exactly the same instruction boundaries (same
 decoded count, full byte coverage), so the comparison is always like-for-like.
 
 Note for future ISA coverage: the naive reference only knows the opcode subset
-in `kSeed`. When adding new instruction families (SSE `0F` map, AVX2/VEX, …),
-extend `NaiveDecodeLength` alongside the library and the seed corpus, then
-re-derive the constants from a Release run.
+in the corpus. When adding new instruction families (more SSE forms,
+AVX2/VEX, …), extend the extension tile and `NaiveDecodeLength` alongside the
+library, then re-derive the constants from a Release run.
 
 ### Environment override
 
@@ -310,8 +317,9 @@ builds.
 
 If the Release baseline changes significantly:
 
-1. Build Release and run `xendiza_bench --mb 8 --iters 40`.
-2. Set the floor to ~50–60% of the reported xendiza MiB/s.
+1. Build Release and run the guard with `XENDIZA_PERF_MIN_MIBS` set above the
+   measured value; the failure message prints the actual MiB/s.
+2. Set the floor to ~50–60% of that value.
 3. Update `kDefaultMinMiBPerSec` in `test/test_perf_regression.cpp` and this
    section, then re-run `ctest -R PerfRegression` to confirm it still passes
    comfortably.
