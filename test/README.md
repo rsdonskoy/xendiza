@@ -226,6 +226,70 @@ Differential testing against capstone/zydis vectors (`test/diff/`) surfaced two 
 
 ---
 
+## Performance Regression Guard
+
+`test/test_perf_regression.cpp` adds a ctest-registered throughput guard for the
+64-bit decode hot path (`xendiza::Disasm<64>`).
+
+### What it measures
+
+The guard uses the same deterministic synthetic corpus as `bench/bench_disasm.cpp`:
+the 79-byte legacy-opcode seed tile (ModR/M, SIB, immediates, and prefixes) tiled
+until it is at least 1 MiB long. The measurement loop is identical to the bench:
+linear `Disasm<64>` sweep, advancing by `di.length`, with 1 warmup iteration
+followed by 5 timed iterations. The best MiB/s across the 5 timed iterations is
+taken as the result, because environmental noise only ever slows a run.
+
+Before the throughput assertion, the test asserts two correctness constants:
+
+- `decoded` = 358,398 instructions per iteration
+- `checksum` = 1,619,428 (sum of `di.length + di.instrId.operand_count` per instruction)
+
+These prevent a "faster but wrong" optimization from passing the gate and stop
+the compiler from eliding the decode loop.
+
+### Throughput floor
+
+The default floor is **25 MiB/s**, roughly 40% of the 61.41 MiB/s Release
+baseline recorded in `bench/README.md` for the synthetic seed (8 MiB, 40
+iterations). The margin is intentionally loose to avoid flaky failures on noisy
+dev machines or CI runners while still catching order-of-magnitude regressions
+(allocation in the hot path, an extra prefix pass, a rescan per instruction, etc.).
+
+On the baseline-class machine the guard actually measures ~67–68 MiB/s in
+Release, so the floor is comfortable.
+
+### Environment override
+
+Set `XENDIZA_PERF_MIN_MIBS` to override the default floor with a positive double:
+
+```bash
+# Relax the gate for a slow CI runner
+XENDIZA_PERF_MIN_MIBS=10 ctest -R PerfRegression
+
+# Tighten it for a local Release gate
+XENDIZA_PERF_MIN_MIBS=50 ctest -R PerfRegression
+```
+
+Invalid or non-positive values fall back to the default.
+
+### Debug builds
+
+The test body begins with `#ifndef NDEBUG → GTEST_SKIP()`. Debug timings are not
+comparable to the Release baseline, so the guard does not run in Debug builds.
+
+### Re-calibration
+
+If the Release baseline changes significantly:
+
+1. Build Release and run `xendiza_bench --mb 8 --iters 40`.
+2. Multiply the reported xendiza MiB/s by a safety factor (e.g. 0.4).
+3. Update `kDefaultMinMiBPerSec` in `test/test_perf_regression.cpp` and this
+   section, then re-run `ctest -R PerfRegression` to confirm it still passes
+   comfortably.
+
+---
+
 ## Operand Contract (Current Scope)
 
 - Tests follow the same global operand contract as `README.md`: decode assertions stop at the operand-form layer for all implemented instruction families.
@@ -253,6 +317,7 @@ ctest -R "X87OpcodeTest"     # x87 D8-DF core matrix
 ctest -R "X86OpcodeExtTest"  # 32-bit 1-byte opcode-extension groups
 ctest -R "X86x87Test"        # 32-bit x87 D8-DF
 ctest -R "X86IncDecTest|X86NoOperandTest|X86InvalidTest|X86PrefixTest|X86SegOverrideTest|X86AddrSizeTest|X86OperandSizeTest|X86JccTest"  # 32-bit prefixes/no-operand/INC-DEC
+ctest -R "PerfRegression"    # Throughput regression guard (Release only)
 ```
 
 ### Run with verbose output:

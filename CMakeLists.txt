@@ -45,6 +45,7 @@ add_executable(xendiza_tests
     test/test_x86_x87_opcodes.cpp
     test/test_x86_prefixes.cpp
     test/test_x64_prefixes.cpp
+    test/test_perf_regression.cpp
 )
 
 target_link_libraries(xendiza_tests PRIVATE xendiza GTest::gtest GTest::gtest_main)
