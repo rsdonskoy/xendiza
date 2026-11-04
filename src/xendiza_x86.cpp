@@ -4,48 +4,6 @@ namespace xendiza::detail {
 
 namespace {
 
-struct SimdArithmeticFamily {
-    std::array<OpcodeId, 4> by_prefix;
-};
-
-struct SimdPrefixVariant {
-    uint8_t opcode_index;
-    Operand mem_operand;
-};
-
-constexpr auto MakeSimdArithmeticFamily(
-    const OpcodeId ps, const OpcodeId pd, const OpcodeId ss, const OpcodeId sd) noexcept
-    -> SimdArithmeticFamily
-{
-    return { { ps, pd, ss, sd } };
-}
-
-// Index by second opcode byte (0x58/59/5C/5E currently used).
-// Family slots are ordered as: none, 66h, F3, F2.
-constexpr auto kSimdArithmeticFamilyByOpcode2 = [] {
-    std::array<SimdArithmeticFamily, 256> table{};
-    for (auto& item : table) {
-        item = MakeSimdArithmeticFamily(
-            OpcodeId::INVALID_OPCODE,
-            OpcodeId::INVALID_OPCODE,
-            OpcodeId::INVALID_OPCODE,
-            OpcodeId::INVALID_OPCODE);
-    }
-    table[0x58] = MakeSimdArithmeticFamily(OpcodeId::ADDPS, OpcodeId::ADDPD, OpcodeId::ADDSS, OpcodeId::ADDSD);
-    table[0x59] = MakeSimdArithmeticFamily(OpcodeId::MULPS, OpcodeId::MULPD, OpcodeId::MULSS, OpcodeId::MULSD);
-    table[0x5C] = MakeSimdArithmeticFamily(OpcodeId::SUBPS, OpcodeId::SUBPD, OpcodeId::SUBSS, OpcodeId::SUBSD);
-    table[0x5E] = MakeSimdArithmeticFamily(OpcodeId::DIVPS, OpcodeId::DIVPD, OpcodeId::DIVSS, OpcodeId::DIVSD);
-    return table;
-}();
-
-// Prefix variant index: 0=none, 1=66h, 2=F3, 3=F2.
-constexpr std::array<SimdPrefixVariant, 4> kSimdPrefixVariants = {
-    SimdPrefixVariant{ 0, Operand::m128 },
-    SimdPrefixVariant{ 1, Operand::m128 },
-    SimdPrefixVariant{ 2, Operand::m32 },
-    SimdPrefixVariant{ 3, Operand::m64 },
-};
-
 // x86-32 keeps an independent 0F-table view so per-mode semantic overrides
 // don't leak into the shared x64 decode table.
 constexpr auto kDecodeTable_1byte_opcode_32 = [] {
@@ -803,117 +761,13 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
         return { total_len, resolved_id };
     }
 
-    // Minimal SIMD P2.4: 0F 10/11 MOVUPS, 0F 28/29 MOVAPS, 0F 2E/2F UCOMISS/COMISS/UCOMISD/COMISD.
-    case 0x65: {
-        if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
-            return ERR_INSUFFICIENT_BUFFER;
-        }
-        if (prefix_info.has_prefix.has_rep != 0) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-        const bool has_66 = prefix_info.has_prefix.has_66 != 0;
-        const auto modrm  = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
-        }
-        const bool is_reg = (modrm & 0b11'000'000u) == 0b11'000'000u;
-        auto resolved_id  = instr_id;
-
-        switch (opcode2) {
-        case 0x10:
-            if (has_66) { return ERR_UNDEFINED_INSTRUCTION; }
-            resolved_id.operands.operand[0] = Operand::xmm;
-            resolved_id.operands.operand[1] = is_reg ? Operand::xmm : Operand::m128;
-            break;
-        case 0x11:
-            if (has_66) { return ERR_UNDEFINED_INSTRUCTION; }
-            resolved_id.operands.operand[0] = is_reg ? Operand::xmm : Operand::m128;
-            resolved_id.operands.operand[1] = Operand::xmm;
-            break;
-        case 0x28:
-            if (has_66) { return ERR_UNDEFINED_INSTRUCTION; }
-            resolved_id.operands.operand[0] = Operand::xmm;
-            resolved_id.operands.operand[1] = is_reg ? Operand::xmm : Operand::m128;
-            break;
-        case 0x29:
-            if (has_66) { return ERR_UNDEFINED_INSTRUCTION; }
-            resolved_id.operands.operand[0] = is_reg ? Operand::xmm : Operand::m128;
-            resolved_id.operands.operand[1] = Operand::xmm;
-            break;
-        case 0x2E:
-            resolved_id.operands.operand[0] = Operand::xmm;
-            resolved_id.operands.operand[1] = is_reg ? Operand::xmm : (has_66 ? Operand::m64 : Operand::m32);
-            if (has_66) { resolved_id.opcode = OpcodeId::UCOMISD; }
-            break;
-        case 0x2F:
-            resolved_id.operands.operand[0] = Operand::xmm;
-            resolved_id.operands.operand[1] = is_reg ? Operand::xmm : (has_66 ? Operand::m64 : Operand::m32);
-            if (has_66) { resolved_id.opcode = OpcodeId::COMISD; }
-            break;
-        default:
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-
-        resolved_id.operands.operand[2] = Operand::noopr;
-        resolved_id.operand_count       = 2;
-        const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
-        return { total_len, resolved_id };
-    }
-
-    // 0F 58/59/5C/5E SIMD arithmetic families with mandatory-prefix remap.
-    case 0x66: {
-        if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
-            return ERR_INSUFFICIENT_BUFFER;
-        }
-        const auto& [by_prefix] = kSimdArithmeticFamilyByOpcode2[opcode2];
-        if (by_prefix[0] == OpcodeId::INVALID_OPCODE) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-
-        const bool has_66  = prefix_info.has_prefix.has_66 != 0;
-        const bool has_rep = prefix_info.has_prefix.has_rep != 0;
-        const auto rep     = prefix_info.rep_byte;
-
-        if (has_66 && has_rep) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-
-        uint8_t variant_key = 0;
-        if (has_66) {
-            variant_key = 1;
-        } else if (has_rep) {
-            if (rep == static_cast<uint8_t>(Prefix32::REPE)) {
-                variant_key = 2;
-            } else if (rep == static_cast<uint8_t>(Prefix32::REPNE)) {
-                variant_key = 3;
-            } else {
-                return ERR_UNDEFINED_INSTRUCTION;
-            }
-        }
-
-        const auto [opcode_index, mem_operand] = kSimdPrefixVariants[variant_key];
-        const auto modrm  = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
-        }
-
-        const bool is_reg = (modrm & 0b11'000'000u) == 0b11'000'000u;
-        auto resolved_id = instr_id;
-        resolved_id.opcode = by_prefix[opcode_index];
-        if (resolved_id.opcode == OpcodeId::INVALID_OPCODE) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-
-        resolved_id.operands.operand[0] = Operand::xmm;
-        resolved_id.operands.operand[1] = is_reg ? Operand::xmm : mem_operand;
-        resolved_id.operands.operand[2] = Operand::noopr;
-        resolved_id.operand_count       = 2;
-
-        const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
-        return { total_len, resolved_id };
-    }
+    // SIMD rows: descriptor-table dispatch (kSimdOpcodeTable + DecodeSimd2Byte).
+    // Same mandatory-prefix remap and rejections as the x64 path; no REX in
+    // 32-bit mode. A 67h prefix switches to 16-bit addressing (no SIB, disp16).
+    case 0x65:
+    case 0x66:
+        return DecodeSimd2Byte(prefix_info, buffer, opcode2, false,
+                               prefix_info.has_prefix.has_67 != 0);
 
     case 0xD6:
         return ERR_UNDEFINED_INSTRUCTION;

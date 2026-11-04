@@ -4,6 +4,7 @@
 #include "instruction.hpp"
 
 #include <array>
+#include <gsl/span>
 
 namespace xendiza {
 
@@ -1381,6 +1382,611 @@ static constexpr std::array<DecodeTableEntry, 256> kDecodeTable_1byte_opcode_sha
     /* F0 */ DTE(0xF0, IID_INVALID),          DTE(0x01, IID(INT1)),              DTE(0xF2, IID_INVALID),           DTE(0xF3, IID_INVALID),            DTE(0x01, IID(HLT)),            DTE(0x01, IID(CMC)),            DTE(0xEE, IID_INVALID),         DTE(0xEE, IID_INVALID),         DTE(0x01, IID(CLC)),               DTE(0x01, IID(STC)),             DTE(0x01, IID(CLI)),             DTE(0x01, IID(STI)),     DTE(0x01, IID(CLD)),      DTE(0x01, IID(STD)),      DTE(0xEE, IID_INVALID),          DTE(0xEE, IID_INVALID),
 } };
 
+// ── SIMD descriptor table + generic engine (mandatory-prefix remap) ──────
+// Migrated from byte-identical copies in xendiza_x64.cpp / xendiza_x86.cpp.
+// One-time 32/64 semantic identity check (2026-11-03): the two copies were
+// byte-identical and both dispatch sites apply the same prefix-slot order
+// (none, 66h, F3, F2) and the same operand shapes (xmm, xmm/mem), so the
+// table is mode-neutral and lives here once. If a mode difference ever
+// appears, derive a per-mode view and override rows; do not duplicate.
+//
+// Descriptor schema (dual-form matrix): each opcode-2 row carries one slot
+// per mandatory-prefix variant {none, 66h, F3, F2}; each slot carries the
+// mod=11 and mod!=11 mnemonics plus full operand pairs for both forms.
+// Store-direction rows (0F 11/29), dual-name rows (0F 12) and REX.W
+// overrides are all slot data — no per-opcode cases.
+
+enum class SimdImmKind : uint8_t {
+    none, // no trailing immediate
+    imm8  // one trailing imm8 byte counted in the length
+};
+
+struct SimdSlot {
+    OpcodeId opcode_reg;  // mod=11 mnemonic; INVALID_OPCODE = form illegal
+    OpcodeId opcode_mem;  // mod!=11 mnemonic; INVALID_OPCODE = form illegal
+    Operands pair_reg;    // full operand pair, mod=11
+    OpcodeId opcode_reg_w = OpcodeId::INVALID_OPCODE; // optional REX.W mnemonic override (reg form)
+    OpcodeId opcode_mem_w = OpcodeId::INVALID_OPCODE; // optional REX.W mnemonic override (mem form)
+    uint8_t rex_w_reg = 0; // bitmask: operand positions widened by REX.W (reg form)
+    uint8_t rex_w_mem = 0; // bitmask: operand positions widened by REX.W (mem form)
+    Operands pair_mem;    // full operand pair, mod!=11
+};
+
+// Operand pair for illegal forms (reg-only / mem-only slot halves).
+inline constexpr Operands kSimdNoOperands = {
+    { Operand::invalid, Operand::invalid, Operand::invalid, Operand::invalid } };
+
+struct SimdRow {
+    std::array<SimdSlot, 4> slots = [] { // index: 0=none, 1=66h, 2=F3, 3=F2
+        std::array<SimdSlot, 4> s{};
+        s.fill({ OpcodeId::INVALID_OPCODE, OpcodeId::INVALID_OPCODE,
+                 kSimdNoOperands,
+                 OpcodeId::INVALID_OPCODE, OpcodeId::INVALID_OPCODE, 0, 0,
+                 kSimdNoOperands });
+        return s;
+    }();
+    SimdImmKind imm_kind = SimdImmKind::none;
+    // Optional 8-entry reg-field sub-table (66 0F 71/72/73 shift groups): the
+    // reg field selects the slot for mod=11 forms; memory forms fall through
+    // to the row slots, which stay INVALID for these rows (reg-only).
+    const std::array<SimdSlot, 8>* reg_subtable = nullptr;
+};
+
+// Slot whose mnemonics are identical for both forms.
+constexpr auto SimdSlotForm(const OpcodeId op, const Operands pair_reg, const Operands pair_mem) noexcept
+    -> SimdSlot
+{
+    SimdSlot slot{};
+    slot.opcode_reg = op;
+    slot.opcode_mem = op;
+    slot.pair_reg   = pair_reg;
+    slot.pair_mem   = pair_mem;
+    return slot;
+}
+
+// Dual-name slot: the register and memory forms report different mnemonics
+// (0F 12 MOVHLPS vs MOVLPS, store-direction rows, reg-only / mem-only slots).
+constexpr auto SimdSlotDual(const OpcodeId op_reg, const Operands pair_reg, const OpcodeId op_mem,
+                            const Operands pair_mem) noexcept -> SimdSlot
+{
+    SimdSlot slot{};
+    slot.opcode_reg = op_reg;
+    slot.opcode_mem = op_mem;
+    slot.pair_reg   = pair_reg;
+    slot.pair_mem   = pair_mem;
+    return slot;
+}
+
+// Slot with a REX.W mnemonic override plus per-form operand-widening masks
+// (MOVD/MOVQ, CVTSI2SS/SD, CVT*2SI). `rex_w` here is always `op_w`; masks are
+// bit i = operand position i widens (r32→r64, m32→m64) under REX.W.
+constexpr auto SimdSlotRexW(const OpcodeId op, const OpcodeId op_w, const Operands pair_reg,
+                            const Operands pair_mem, const uint8_t mask_reg,
+                            const uint8_t mask_mem) noexcept -> SimdSlot
+{
+    SimdSlot slot = SimdSlotForm(op, pair_reg, pair_mem);
+    slot.opcode_reg_w = op_w;
+    slot.opcode_mem_w = op_w;
+    slot.rex_w_reg    = mask_reg;
+    slot.rex_w_mem    = mask_mem;
+    return slot;
+}
+
+// Row with only the none (PS) and 66h (PD) slots filled; both m128 sources.
+constexpr auto SimdPsPdRow(const OpcodeId ps_op, const OpcodeId pd_op) noexcept -> SimdRow
+{
+    SimdRow row{};
+    row.slots[0] = SimdSlotForm(ps_op, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    row.slots[1] = SimdSlotForm(pd_op, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    return row;
+}
+
+// Row where a single prefix slot decodes (dual-name capable), all others INVALID.
+constexpr auto SimdSingleSlotRow(const uint8_t slot_index, const OpcodeId op_reg,
+                                 const Operands pair_reg, const OpcodeId op_mem,
+                                 const Operands pair_mem) noexcept -> SimdRow
+{
+    SimdRow row{};
+    auto&       slot      = row.slots[slot_index];
+    slot.opcode_reg       = op_reg;
+    slot.opcode_mem       = op_mem;
+    slot.pair_reg         = pair_reg;
+    slot.pair_mem         = pair_mem;
+    return row;
+}
+
+// Classic PS/PD/SS/SD family row: none→ps, 66h→pd, F3→ss, F2→sd; every slot
+// decodes both forms with the packed/scalar memory class.
+constexpr auto SimdFamilyRow(const OpcodeId ps, const OpcodeId pd, const OpcodeId ss,
+                             const OpcodeId sd) noexcept -> SimdRow
+{
+    SimdRow row{};
+    row.slots[0] = SimdSlotForm(ps, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    row.slots[1] = SimdSlotForm(pd, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    row.slots[2] = SimdSlotForm(ss, OPRS2(xmm, xmm), OPRS2(xmm, m32));
+    row.slots[3] = SimdSlotForm(sd, OPRS2(xmm, xmm), OPRS2(xmm, m64));
+    return row;
+}
+
+// Widens a marked operand under REX.W only; the SIMD engine never applies a
+// 66h shrink (66h here is a mandatory prefix, not an operand-size override).
+constexpr auto SimdWidenOperandRexW(const Operand op) noexcept -> Operand
+{
+    switch (op) {
+    case Operand::r32:       return Operand::r64;
+    case Operand::m32:       return Operand::m64;
+    case Operand::stack_m32: return Operand::stack_m64;
+    default:                 return op;
+    }
+}
+
+// Reg-field sub-table slot for the 66 0F 71/72/73 shift groups: single xmm
+// destination; the trailing imm8 is appended by the engine (imm_kind).
+constexpr auto SimdSubSlot(const OpcodeId op) noexcept -> SimdSlot
+{
+    SimdSlot slot{};
+    slot.opcode_reg = op;
+    slot.pair_reg   = { { Operand::xmm, Operand::noopr, Operand::noopr, Operand::noopr } };
+    return slot;
+}
+
+constexpr auto SimdShiftSubTableFill() noexcept -> std::array<SimdSlot, 8>
+{
+    std::array<SimdSlot, 8> t{};
+    t.fill({ OpcodeId::INVALID_OPCODE, OpcodeId::INVALID_OPCODE, kSimdNoOperands,
+             OpcodeId::INVALID_OPCODE, OpcodeId::INVALID_OPCODE, 0, 0, kSimdNoOperands });
+    return t;
+}
+
+// /2 PSRLW, /4 PSRAW, /6 PSLLW; other reg slots reserved.
+inline constexpr auto kSimdShiftSub71 = [] {
+    auto t = SimdShiftSubTableFill();
+    t[2] = SimdSubSlot(OpcodeId::PSRLW);
+    t[4] = SimdSubSlot(OpcodeId::PSRAW);
+    t[6] = SimdSubSlot(OpcodeId::PSLLW);
+    return t;
+}();
+
+// /2 PSRLD, /4 PSRAD, /6 PSLLD.
+inline constexpr auto kSimdShiftSub72 = [] {
+    auto t = SimdShiftSubTableFill();
+    t[2] = SimdSubSlot(OpcodeId::PSRLD);
+    t[4] = SimdSubSlot(OpcodeId::PSRAD);
+    t[6] = SimdSubSlot(OpcodeId::PSLLD);
+    return t;
+}();
+
+// /2 PSRLQ, /3 PSRLDQ, /6 PSLLQ, /7 PSLLDQ.
+inline constexpr auto kSimdShiftSub73 = [] {
+    auto t = SimdShiftSubTableFill();
+    t[2] = SimdSubSlot(OpcodeId::PSRLQ);
+    t[3] = SimdSubSlot(OpcodeId::PSRLDQ);
+    t[6] = SimdSubSlot(OpcodeId::PSLLQ);
+    t[7] = SimdSubSlot(OpcodeId::PSLLDQ);
+    return t;
+}();
+
+// 66-mandatory reg-field shift-group row: register forms resolve through the
+// sub-table; all four prefix slots stay INVALID so memory forms (and the
+// no-66 MMX forms) decode undefined.
+constexpr auto SimdShiftGroupRow(const std::array<SimdSlot, 8>* subtable) noexcept -> SimdRow
+{
+    SimdRow row{};
+    row.imm_kind      = SimdImmKind::imm8;
+    row.reg_subtable  = subtable;
+    return row;
+}
+
+// Uniform 66-mandatory packed-integer row: the 66 slot decodes xmm, xmm/m128;
+// the none/F3/F2 slots stay INVALID (the MMX forms are strictly rejected).
+constexpr auto SimdPackedRow(const OpcodeId op) noexcept -> SimdRow
+{
+    SimdRow row{};
+    row.slots[1] = SimdSlotForm(op, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    return row;
+}
+
+// Index by second opcode byte. Rows not listed are INVALID in every slot and
+// decode as undefined-instruction.
+inline constexpr auto kSimdOpcodeTable = [] {
+    std::array<SimdRow, 256> table{};
+
+    // 0F 10/11: full SSE1/SSE2 remap — MOVUPS/MOVUPD (none/66h, m128),
+    // MOVSS/MOVSD (F3/F2, m32/m64); 0F 11 is the store-direction counterpart.
+    table[0x10].slots[0] = SimdSlotForm(OpcodeId::MOVUPS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x10].slots[1] = SimdSlotForm(OpcodeId::MOVUPD, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x10].slots[2] = SimdSlotForm(OpcodeId::MOVSS, OPRS2(xmm, xmm), OPRS2(xmm, m32));
+    table[0x10].slots[3] = SimdSlotForm(OpcodeId::MOVSD, OPRS2(xmm, xmm), OPRS2(xmm, m64));
+    table[0x11].slots[0] = SimdSlotForm(OpcodeId::MOVUPS, OPRS2(xmm, xmm), OPRS2(m128, xmm));
+    table[0x11].slots[1] = SimdSlotForm(OpcodeId::MOVUPD, OPRS2(xmm, xmm), OPRS2(m128, xmm));
+    table[0x11].slots[2] = SimdSlotForm(OpcodeId::MOVSS, OPRS2(xmm, xmm), OPRS2(m32, xmm));
+    table[0x11].slots[3] = SimdSlotForm(OpcodeId::MOVSD, OPRS2(xmm, xmm), OPRS2(m64, xmm));
+    // 0F 28/29 MOVAPS/MOVAPD: none/66h only (m128); F3/F2 absent.
+    table[0x28].slots[0] = SimdSlotForm(OpcodeId::MOVAPS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x28].slots[1] = SimdSlotForm(OpcodeId::MOVAPD, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x29].slots[0] = SimdSlotForm(OpcodeId::MOVAPS, OPRS2(xmm, xmm), OPRS2(m128, xmm));
+    table[0x29].slots[1] = SimdSlotForm(OpcodeId::MOVAPD, OPRS2(xmm, xmm), OPRS2(m128, xmm));
+    // 0F 2E/2F UCOMIS/COMIS: none → SS (m32), 66h → SD (m64); REP forms rejected.
+    table[0x2E] = SimdSingleSlotRow(0, OpcodeId::UCOMISS, OPRS2(xmm, xmm), OpcodeId::UCOMISS, OPRS2(xmm, m32));
+    table[0x2E].slots[1] = SimdSlotForm(OpcodeId::UCOMISD, OPRS2(xmm, xmm), OPRS2(xmm, m64));
+    table[0x2F] = SimdSingleSlotRow(0, OpcodeId::COMISS, OPRS2(xmm, xmm), OpcodeId::COMISS, OPRS2(xmm, m32));
+    table[0x2F].slots[1] = SimdSlotForm(OpcodeId::COMISD, OPRS2(xmm, xmm), OPRS2(xmm, m64));
+
+    // Arithmetic families with full mandatory-prefix remap.
+    table[0x58] = SimdFamilyRow(OpcodeId::ADDPS, OpcodeId::ADDPD, OpcodeId::ADDSS, OpcodeId::ADDSD);
+    table[0x59] = SimdFamilyRow(OpcodeId::MULPS, OpcodeId::MULPD, OpcodeId::MULSS, OpcodeId::MULSD);
+    table[0x5C] = SimdFamilyRow(OpcodeId::SUBPS, OpcodeId::SUBPD, OpcodeId::SUBSS, OpcodeId::SUBSD);
+    table[0x5E] = SimdFamilyRow(OpcodeId::DIVPS, OpcodeId::DIVPD, OpcodeId::DIVSS, OpcodeId::DIVSD);
+
+    // ── M1: prefix-remap binary rows ─────────────────────────────────────
+    // 0F 51 sqrt: full remap.
+    table[0x51] = SimdFamilyRow(OpcodeId::SQRTPS, OpcodeId::SQRTPD, OpcodeId::SQRTSS, OpcodeId::SQRTSD);
+    // 0F 52 rsqrt / 0F 53 rcp: none = packed (m128), F3 = scalar RSQRTSS /
+    // RCPSS (m32, SDM-verified 2026-11-04); 66h and F2 are absent variants.
+    table[0x52].slots[0] = SimdSlotForm(OpcodeId::RSQRTPS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x52].slots[2] = SimdSlotForm(OpcodeId::RSQRTSS, OPRS2(xmm, xmm), OPRS2(xmm, m32));
+    table[0x53].slots[0] = SimdSlotForm(OpcodeId::RCPPS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x53].slots[2] = SimdSlotForm(OpcodeId::RCPSS, OPRS2(xmm, xmm), OPRS2(xmm, m32));
+    // 0F 54-57 logical: PS + PD only (F3/F2 absent).
+    table[0x54] = SimdPsPdRow(OpcodeId::ANDPS, OpcodeId::ANDPD);
+    table[0x55] = SimdPsPdRow(OpcodeId::ANDNPS, OpcodeId::ANDNPD);
+    table[0x56] = SimdPsPdRow(OpcodeId::ORPS, OpcodeId::ORPD);
+    table[0x57] = SimdPsPdRow(OpcodeId::XORPS, OpcodeId::XORPD);
+    // 0F 5A packed/scalar CVT: reg form always xmm,xmm; memory class per slot
+    // (PS2PD reads m64, PD2PS reads m128, SS2SD reads m32, SD2SS reads m64).
+    table[0x5A].slots[0] = SimdSlotForm(OpcodeId::CVTPS2PD, OPRS2(xmm, xmm), OPRS2(xmm, m64));
+    table[0x5A].slots[1] = SimdSlotForm(OpcodeId::CVTPD2PS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x5A].slots[2] = SimdSlotForm(OpcodeId::CVTSS2SD, OPRS2(xmm, xmm), OPRS2(xmm, m32));
+    table[0x5A].slots[3] = SimdSlotForm(OpcodeId::CVTSD2SS, OPRS2(xmm, xmm), OPRS2(xmm, m64));
+    // 0F 5B int<->ps CVT: none/66/F3 packed m128; F2 absent.
+    table[0x5B].slots[0] = SimdSlotForm(OpcodeId::CVTDQ2PS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x5B].slots[1] = SimdSlotForm(OpcodeId::CVTPS2DQ, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x5B].slots[2] = SimdSlotForm(OpcodeId::CVTTPS2DQ, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    // 0F 5D min / 0F 5F max: full remap.
+    table[0x5D] = SimdFamilyRow(OpcodeId::MINPS, OpcodeId::MINPD, OpcodeId::MINSS, OpcodeId::MINSD);
+    table[0x5F] = SimdFamilyRow(OpcodeId::MAXPS, OpcodeId::MAXPD, OpcodeId::MAXSS, OpcodeId::MAXSD);
+    // 66/F2/F3 0F E6 double/int CVT: none absent; F3 reads m64, others m128.
+    table[0xE6].slots[1] = SimdSlotForm(OpcodeId::CVTPD2DQ, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0xE6].slots[2] = SimdSlotForm(OpcodeId::CVTDQ2PD, OPRS2(xmm, xmm), OPRS2(xmm, m64));
+    table[0xE6].slots[3] = SimdSlotForm(OpcodeId::CVTTPD2DQ, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    // SSE3 riders: 66/F2 0F D0 ADDSUB, 66/F2 0F 7C/7D HADD/HSUB; none/F3 absent.
+    table[0xD0].slots[1] = SimdSlotForm(OpcodeId::ADDSUBPD, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0xD0].slots[3] = SimdSlotForm(OpcodeId::ADDSUBPS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x7C].slots[1] = SimdSlotForm(OpcodeId::HADDPD, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x7C].slots[3] = SimdSlotForm(OpcodeId::HADDPS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x7D].slots[1] = SimdSlotForm(OpcodeId::HSUBPD, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x7D].slots[3] = SimdSlotForm(OpcodeId::HSUBPS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+
+    // ── M2: irregular MOV/CVT/GPR rows ───────────────────────────────────
+    // 0F 12: dual-name (reg MOVHLPS / mem MOVLPS m64); 66h MOVLPD both forms;
+    // F3 MOVSLDUP (SSE3 rider). 0F 16 mirrors with MOVLHPS/MOVHPS/MOVHPD/
+    // MOVSHDUP. (F2 0F 12/16 MOVDDUP is not in this change's rider list.)
+    table[0x12].slots[0] = SimdSlotDual(OpcodeId::MOVHLPS, OPRS2(xmm, xmm), OpcodeId::MOVLPS, OPRS2(xmm, m64));
+    // 66 0F 12 MOVLPD: memory source only — the register form is reserved (#UD).
+    table[0x12].slots[1] = SimdSlotDual(OpcodeId::INVALID_OPCODE, kSimdNoOperands,
+                                        OpcodeId::MOVLPD, OPRS2(xmm, m64));
+    table[0x12].slots[2] = SimdSlotForm(OpcodeId::MOVSLDUP, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x13].slots[0] = SimdSlotDual(OpcodeId::INVALID_OPCODE,
+                                        kSimdNoOperands,
+                                        OpcodeId::MOVLPS, OPRS2(m64, xmm));
+    table[0x13].slots[1] = SimdSlotDual(OpcodeId::INVALID_OPCODE,
+                                        kSimdNoOperands,
+                                        OpcodeId::MOVLPD, OPRS2(m64, xmm));
+    table[0x16].slots[0] = SimdSlotDual(OpcodeId::MOVLHPS, OPRS2(xmm, xmm), OpcodeId::MOVHPS, OPRS2(xmm, m64));
+    // 66 0F 16 MOVHPD: memory source only — the register form is reserved (#UD).
+    table[0x16].slots[1] = SimdSlotDual(OpcodeId::INVALID_OPCODE, kSimdNoOperands,
+                                        OpcodeId::MOVHPD, OPRS2(xmm, m64));
+    table[0x16].slots[2] = SimdSlotForm(OpcodeId::MOVSHDUP, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x17].slots[0] = SimdSlotDual(OpcodeId::INVALID_OPCODE,
+                                        kSimdNoOperands,
+                                        OpcodeId::MOVHPS, OPRS2(m64, xmm));
+    table[0x17].slots[1] = SimdSlotDual(OpcodeId::INVALID_OPCODE,
+                                        kSimdNoOperands,
+                                        OpcodeId::MOVHPD, OPRS2(m64, xmm));
+    // 0F 50: MOVMSKPS/MOVMSKPD r32, xmm — register-form only; REX.W ignored
+    // (Decision 12: no upgraded encodings exist).
+    table[0x50].slots[0] = SimdSlotDual(OpcodeId::MOVMSKPS, OPRS2(r32, xmm), OpcodeId::INVALID_OPCODE,
+                                        { { Operand::invalid, Operand::invalid, Operand::invalid, Operand::invalid } });
+    table[0x50].slots[1] = SimdSlotDual(OpcodeId::MOVMSKPD, OPRS2(r32, xmm), OpcodeId::INVALID_OPCODE,
+                                        { { Operand::invalid, Operand::invalid, Operand::invalid, Operand::invalid } });
+    // F2/F3 0F 2A CVTSI2SS/SD xmm, r32/m32 — REX.W upgrades the GPR source in
+    // both forms (r32→r64, m32→m64). none/66 slots are the MMX forms (INVALID).
+    table[0x2A].slots[2] = SimdSlotRexW(OpcodeId::CVTSI2SS, OpcodeId::CVTSI2SS, OPRS2(xmm, r32),
+                                        OPRS2(xmm, m32), 0x02, 0x02);
+    table[0x2A].slots[3] = SimdSlotRexW(OpcodeId::CVTSI2SD, OpcodeId::CVTSI2SD, OPRS2(xmm, r32),
+                                        OPRS2(xmm, m32), 0x02, 0x02);
+    // F2/F3 0F 2C/2D CVTT*/CVT* to GPR — REX.W widens only the destination
+    // (source stays xmm/m32 for F3, xmm/m64 for F2). none/66 slots are MMX.
+    table[0x2C].slots[2] = SimdSlotRexW(OpcodeId::CVTTSS2SI, OpcodeId::CVTTSS2SI, OPRS2(r32, xmm),
+                                        OPRS2(r32, m32), 0x01, 0x01);
+    table[0x2C].slots[3] = SimdSlotRexW(OpcodeId::CVTTSD2SI, OpcodeId::CVTTSD2SI, OPRS2(r32, xmm),
+                                        OPRS2(r32, m64), 0x01, 0x01);
+    table[0x2D].slots[2] = SimdSlotRexW(OpcodeId::CVTSS2SI, OpcodeId::CVTSS2SI, OPRS2(r32, xmm),
+                                        OPRS2(r32, m32), 0x01, 0x01);
+    table[0x2D].slots[3] = SimdSlotRexW(OpcodeId::CVTSD2SI, OpcodeId::CVTSD2SI, OPRS2(r32, xmm),
+                                        OPRS2(r32, m64), 0x01, 0x01);
+    // 66 0F 6E/7E MOVD <-> MOVQ under REX.W (mnemonic override + widening) in
+    // both directions. F3 0F 7E is the XMM quadword load; unprefixed MMX forms are rejected.
+    table[0x6E].slots[1] = SimdSlotRexW(OpcodeId::MOVD, OpcodeId::MOVQ, OPRS2(xmm, r32),
+                                        OPRS2(xmm, m32), 0x02, 0x02);
+    table[0x7E].slots[1] = SimdSlotRexW(OpcodeId::MOVD, OpcodeId::MOVQ, OPRS2(r32, xmm),
+                                        OPRS2(m32, xmm), 0x01, 0x01);
+    table[0x7E].slots[2] = SimdSlotForm(OpcodeId::MOVQ, OPRS2(xmm, xmm), OPRS2(xmm, m64));
+    // 66 0F D6 MOVQ xmm2/m64, xmm1: BOTH forms are legal — the register form
+    // (MOVQ xmm, xmm) is the canonical reg-reg copy; F2/F3 D6 are the MMX
+    // MOVQ2DQ/DQ2Q variants (INVALID).
+    table[0xD6].slots[1] = SimdSlotForm(OpcodeId::MOVQ, OPRS2(xmm, xmm), OPRS2(m64, xmm));
+    // 66 0F D7 PMOVMSKB r32, xmm — register-form only; REX.W ignored (Decision 12).
+    table[0xD7].slots[1] = SimdSlotDual(OpcodeId::PMOVMSKB, OPRS2(r32, xmm), OpcodeId::INVALID_OPCODE,
+                                        { { Operand::invalid, Operand::invalid, Operand::invalid, Operand::invalid } });
+    // 66 0F E7 MOVNTDQ m128, xmm — memory destination only.
+    table[0xE7].slots[1] = SimdSlotDual(OpcodeId::INVALID_OPCODE,
+                                        kSimdNoOperands,
+                                        OpcodeId::MOVNTDQ, OPRS2(m128, xmm));
+    // 66 0F F7 MASKMOVDQU xmm, xmm — register form only.
+    table[0xF7].slots[1] = SimdSlotDual(OpcodeId::MASKMOVDQU, OPRS2(xmm, xmm), OpcodeId::INVALID_OPCODE,
+                                        { { Operand::invalid, Operand::invalid, Operand::invalid, Operand::invalid } });
+
+    // ── M3: trailing-immediate rows ──────────────────────────────────────
+    // 0F C2 compare predicate: full PS/PD/SS/SD remap, trailing imm8.
+    table[0xC2] = SimdFamilyRow(OpcodeId::CMPPS, OpcodeId::CMPPD, OpcodeId::CMPSS, OpcodeId::CMPSD);
+    table[0xC2].imm_kind = SimdImmKind::imm8;
+    // 0F C6 shuffle: PS + PD only, trailing imm8; F3/F2 absent.
+    table[0xC6].slots[0] = SimdSlotForm(OpcodeId::SHUFPS, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0xC6].slots[1] = SimdSlotForm(OpcodeId::SHUFPD, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0xC6].imm_kind = SimdImmKind::imm8;
+    // 0F 70 packed shuffle: 66 PSHUFD, F3 PSHUFHW, F2 PSHUFLW; none absent (MMX).
+    table[0x70].slots[1] = SimdSlotForm(OpcodeId::PSHUFD, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x70].slots[2] = SimdSlotForm(OpcodeId::PSHUFHW, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x70].slots[3] = SimdSlotForm(OpcodeId::PSHUFLW, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x70].imm_kind = SimdImmKind::imm8;
+    // 66 0F C4 PINSRW xmm, r32/m16, imm8 (REX.W ignored — no upgraded encoding).
+    table[0xC4].slots[1] = SimdSlotForm(OpcodeId::PINSRW, OPRS2(xmm, r32), OPRS2(xmm, m16));
+    table[0xC4].imm_kind = SimdImmKind::imm8;
+    // 66 0F C5 PEXTRW r32, xmm, imm8 — register form only (REX.W ignored,
+    // spec scenario; PEXTRQ exists only as SSE4.1 66 0F 3A 16, out of scope).
+    table[0xC5].slots[1] = SimdSlotDual(OpcodeId::PEXTRW, OPRS2(r32, xmm), OpcodeId::INVALID_OPCODE,
+                                        { { Operand::invalid, Operand::invalid, Operand::invalid, Operand::invalid } });
+    table[0xC5].imm_kind = SimdImmKind::imm8;
+    // 66 0F 71/72/73 shift groups: reg-field sub-mnemonics, register form
+    // only, trailing imm8 (design.md Decision 6).
+    table[0x71] = SimdShiftGroupRow(&kSimdShiftSub71);
+    table[0x72] = SimdShiftGroupRow(&kSimdShiftSub72);
+    table[0x73] = SimdShiftGroupRow(&kSimdShiftSub73);
+
+    // ── M4: SSE2 packed-integer block (explicit enumeration, design.md
+    // Decision 11) ──────────────────────────────────────────────────────────
+    // Derivation (2026-11-04): the row list below was derived from the SDM
+    // opcode-map tables (per-instruction encoding tables on an SDM-derived
+    // reference) and cross-checked against the bundled vectors; the corpus
+    // carries direct vector coverage only for 66 0F D6/D7 (capstone x86.yaml
+    // #46, x86_64-encoding.s.yaml #55), which match. Ranges NOT listed here
+    // (70, 71-73, 77, D0, D6, D7, E6, E7, F0, F7, FF) carry dedicated rows
+    // from earlier milestones or stay INVALID (77 EMMS / FF UD0).
+    // Verified uniform xmm, xmm/m128 rows under mandatory 66h:
+    table[0x60] = SimdPackedRow(OpcodeId::PUNPCKLBW);
+    table[0x61] = SimdPackedRow(OpcodeId::PUNPCKLWD);
+    table[0x62] = SimdPackedRow(OpcodeId::PUNPCKLDQ);
+    table[0x63] = SimdPackedRow(OpcodeId::PACKSSWB);
+    table[0x64] = SimdPackedRow(OpcodeId::PCMPGTB);
+    table[0x65] = SimdPackedRow(OpcodeId::PCMPGTW);
+    table[0x66] = SimdPackedRow(OpcodeId::PCMPGTD);
+    table[0x67] = SimdPackedRow(OpcodeId::PACKUSWB);
+    table[0x68] = SimdPackedRow(OpcodeId::PUNPCKHBW);
+    table[0x69] = SimdPackedRow(OpcodeId::PUNPCKHWD);
+    table[0x6A] = SimdPackedRow(OpcodeId::PUNPCKHDQ);
+    table[0x6B] = SimdPackedRow(OpcodeId::PACKSSDW);
+    table[0x6C] = SimdPackedRow(OpcodeId::PUNPCKLQDQ);
+    table[0x6D] = SimdPackedRow(OpcodeId::PUNPCKHQDQ);
+    // 6F MOVDQA load + F3 MOVDQU load (66/F3 only; none is the MMX MOVQ).
+    table[0x6F].slots[1] = SimdSlotForm(OpcodeId::MOVDQA, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    table[0x6F].slots[2] = SimdSlotForm(OpcodeId::MOVDQU, OPRS2(xmm, xmm), OPRS2(xmm, m128));
+    // 74-76 PCMPEQB/W/D (77 EMMS is MMX-only and stays on the 1-byte path).
+    table[0x74] = SimdPackedRow(OpcodeId::PCMPEQB);
+    table[0x75] = SimdPackedRow(OpcodeId::PCMPEQW);
+    table[0x76] = SimdPackedRow(OpcodeId::PCMPEQD);
+    // 7F store-direction counterparts: register form {xmm, xmm}, memory form
+    // {m128, xmm} (66 MOVDQA, F3 MOVDQU).
+    table[0x7F].slots[1] = SimdSlotForm(OpcodeId::MOVDQA, OPRS2(xmm, xmm), OPRS2(m128, xmm));
+    table[0x7F].slots[2] = SimdSlotForm(OpcodeId::MOVDQU, OPRS2(xmm, xmm), OPRS2(m128, xmm));
+    table[0xD1] = SimdPackedRow(OpcodeId::PSRLW);
+    table[0xD2] = SimdPackedRow(OpcodeId::PSRLD);
+    table[0xD3] = SimdPackedRow(OpcodeId::PSRLQ);
+    table[0xD4] = SimdPackedRow(OpcodeId::PADDQ);
+    table[0xD5] = SimdPackedRow(OpcodeId::PMULLW);
+    table[0xD8] = SimdPackedRow(OpcodeId::PSUBUSB);
+    table[0xD9] = SimdPackedRow(OpcodeId::PSUBUSW);
+    table[0xDA] = SimdPackedRow(OpcodeId::PMINUB);
+    table[0xDB] = SimdPackedRow(OpcodeId::PAND);
+    table[0xDC] = SimdPackedRow(OpcodeId::PADDUSB);
+    table[0xDD] = SimdPackedRow(OpcodeId::PADDUSW);
+    table[0xDE] = SimdPackedRow(OpcodeId::PMAXUB);
+    table[0xDF] = SimdPackedRow(OpcodeId::PANDN);
+    table[0xE0] = SimdPackedRow(OpcodeId::PAVGB);
+    table[0xE1] = SimdPackedRow(OpcodeId::PSRAW);
+    table[0xE2] = SimdPackedRow(OpcodeId::PSRAD);
+    table[0xE3] = SimdPackedRow(OpcodeId::PAVGW);
+    table[0xE4] = SimdPackedRow(OpcodeId::PMULHUW);
+    table[0xE5] = SimdPackedRow(OpcodeId::PMULHW);
+    table[0xE8] = SimdPackedRow(OpcodeId::PSUBSB);
+    table[0xE9] = SimdPackedRow(OpcodeId::PSUBSW);
+    table[0xEA] = SimdPackedRow(OpcodeId::PMINSW);
+    table[0xEB] = SimdPackedRow(OpcodeId::POR);
+    table[0xEC] = SimdPackedRow(OpcodeId::PADDSB);
+    table[0xED] = SimdPackedRow(OpcodeId::PADDSW);
+    table[0xEE] = SimdPackedRow(OpcodeId::PMAXSW);
+    table[0xEF] = SimdPackedRow(OpcodeId::PXOR);
+    table[0xF1] = SimdPackedRow(OpcodeId::PSLLW);
+    table[0xF2] = SimdPackedRow(OpcodeId::PSLLD);
+    table[0xF3] = SimdPackedRow(OpcodeId::PSLLQ);
+    table[0xF4] = SimdPackedRow(OpcodeId::PMULUDQ);
+    table[0xF5] = SimdPackedRow(OpcodeId::PMADDWD);
+    table[0xF6] = SimdPackedRow(OpcodeId::PSADBW);
+    table[0xF8] = SimdPackedRow(OpcodeId::PSUBB);
+    table[0xF9] = SimdPackedRow(OpcodeId::PSUBW);
+    table[0xFA] = SimdPackedRow(OpcodeId::PSUBD);
+    table[0xFB] = SimdPackedRow(OpcodeId::PSUBQ);
+    table[0xFC] = SimdPackedRow(OpcodeId::PADDB);
+    table[0xFD] = SimdPackedRow(OpcodeId::PADDW);
+    table[0xFE] = SimdPackedRow(OpcodeId::PADDD);
+    // F2 0F F0 LDDQU xmm1, m128 (SSE3 rider): memory source only — the
+    // register form is reserved (#UD); every other prefix undefined.
+    table[0xF0].slots[3] = SimdSlotDual(OpcodeId::INVALID_OPCODE, kSimdNoOperands,
+                                        OpcodeId::LDDQU, OPRS2(xmm, m128));
+
+    return table;
+}();
+
+// Generic SIMD execution engine. Three uniform rules (design.md Decision 2):
+//   1. mixed mandatory prefixes (66h + F2/F3) → UNDEFINED (enforced by the
+//      slot selection at the dispatch helper, never reaches a slot);
+//   2. REX.W applies only to operands the descriptor marks (rex_w_* masks)
+//      plus any declared per-form mnemonic override; 66h never shrinks;
+//      unmarked rows ignore REX.W entirely;
+//   3. any INVALID mnemonic or operand in the selected slot → UNDEFINED.
+// `modrm_len` comes from the caller (kLengthTable_ModRM + SIB base=5 fix);
+// the returned length is relative to the start of the 0F byte.
+constexpr auto DecodeSimdRow(const SimdRow& row, const uint8_t slot_index, const bool rex_w,
+                             const uint8_t modrm, const uint8_t modrm_len) noexcept
+    -> DecodedInstruction
+{
+    const bool is_reg = (modrm & 0b11'000'000u) == 0b11'000'000u;
+    // Reg-field sub-table rows (66 0F 71/72/73): the 66h slot's mod=11 forms
+    // resolve through the sub-table; memory forms and the absent prefixes
+    // (none/F3/F2, incl. the MMX forms) use the row slots (INVALID there).
+    const auto& slot = (is_reg && row.reg_subtable != nullptr && slot_index == 1)
+        ? (*row.reg_subtable)[(modrm >> 3) & 7u]
+        : row.slots[slot_index];
+
+    auto opcode = is_reg ? slot.opcode_reg : slot.opcode_mem;
+    auto pair   = is_reg ? slot.pair_reg : slot.pair_mem;
+    if (opcode == OpcodeId::INVALID_OPCODE || pair.operand[0] == Operand::invalid
+        || pair.operand[1] == Operand::invalid) {
+        return ERR_UNDEFINED_INSTRUCTION;
+    }
+
+    if (rex_w) {
+        const auto override_op = is_reg ? slot.opcode_reg_w : slot.opcode_mem_w;
+        if (override_op != OpcodeId::INVALID_OPCODE) {
+            opcode = override_op;
+        }
+        const auto widen_mask = is_reg ? slot.rex_w_reg : slot.rex_w_mem;
+        for (uint8_t i = 0; i < pair.operand.size(); ++i) {
+            if (widen_mask & (1u << i)) {
+                pair.operand[i] = SimdWidenOperandRexW(pair.operand[i]);
+            }
+        }
+    }
+
+    InstructionId id{};
+    id.opcode   = opcode;
+    id.operands = pair;
+    // Pair operand count: single-operand shift forms carry {xmm}, all other
+    // SSE rows carry two operands. The trailing immediate appends after them.
+    id.operand_count = (pair.operand[1] == Operand::noopr) ? 1 : 2;
+
+    // Trailing immediate occupies the first noopr slot (ordered operands).
+    uint8_t imm_size = 0;
+    if (row.imm_kind == SimdImmKind::imm8) {
+        id.operands.operand[id.operand_count] = Operand::imm8;
+        ++id.operand_count;
+        imm_size = 1;
+    }
+
+    return { static_cast<uint8_t>(modrm_len + 1 + imm_size), id };
+}
+
+// Mandatory-prefix slot selection. Returns false for the mixed mandatory
+// prefix rule (66h co-occurring with F2/F3) or an unknown REP byte.
+template <typename PrefixInfoT>
+constexpr auto SelectSimdSlot(const PrefixInfoT& prefix_info, uint8_t& slot_out) noexcept -> bool
+{
+    if (prefix_info.has_prefix.has_66 != 0 && prefix_info.has_prefix.has_rep != 0) {
+        return false;
+    }
+    if (prefix_info.has_prefix.has_66 != 0) {
+        slot_out = 1;
+        return true;
+    }
+    if (prefix_info.has_prefix.has_rep != 0) {
+        if (prefix_info.rep_byte == 0xF3) {
+            slot_out = 2;
+            return true;
+        }
+        if (prefix_info.rep_byte == 0xF2) {
+            slot_out = 3;
+            return true;
+        }
+        return false;
+    }
+    slot_out = 0;
+    return true;
+}
+
+// Shared 2-byte SIMD dispatch: ModR/M read + SIB base=5 fix + engine call.
+// Used by both the x64 and x86 Decode2ByteOpcode paths (dispatch codes 0x65
+// and 0x66). `rex_w` is false in 32-bit mode (no REX prefixes there);
+// `addr16` is true for the 32-bit path under a 67h prefix (16-bit addressing:
+// no SIB byte, disp16 where the 32-bit form has none).
+template <typename PrefixInfoT>
+constexpr auto DecodeSimd2Byte(const PrefixInfoT& prefix_info, const gsl::span<const uint8_t> buffer,
+                               const uint8_t opcode2, const bool rex_w, const bool addr16 = false) noexcept
+    -> DecodedInstruction
+{
+    if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
+        return ERR_INSUFFICIENT_BUFFER;
+    }
+
+    uint8_t slot_index = 0;
+    if (!SelectSimdSlot(prefix_info, slot_index)) {
+        return ERR_UNDEFINED_INSTRUCTION;
+    }
+
+    const auto modrm  = buffer[prefix_info.length + 2];
+    uint8_t modrm_len = 0;
+    if (addr16) {
+        // 16-bit addressing: rm=100 is [SI], not a SIB escape; mod=00/rm=110
+        // and mod=10 carry disp16; mod=01 carries disp8.
+        const uint8_t mod = static_cast<uint8_t>(modrm >> 6);
+        const uint8_t rm  = static_cast<uint8_t>(modrm & 7u);
+        // kLengthTable_ModRM convention: opcode + ModR/M + displacement (+SIB).
+        modrm_len = 2;
+        if (mod == 1) {
+            modrm_len = 3; // + disp8
+        } else if (mod == 2 || (mod == 0 && rm == 6)) {
+            modrm_len = 4; // + disp16
+        }
+    } else {
+        modrm_len = kLengthTable_ModRM[modrm];
+
+        // For mod=00,r/m=100, SIB is present. If SIB.base=101, disp32 is mandatory.
+        if (ModrmHasSib(modrm)) {
+            if (buffer.size() <= static_cast<size_t>(prefix_info.length + 3)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
+            if (const auto sib = buffer[prefix_info.length + 3];
+                (modrm & 0b11'000'000u) == 0b00'000'000u
+                && (sib & 0b000'000'111u) == 0b000'000'101u) {
+                modrm_len = static_cast<uint8_t>(modrm_len + 4);
+            }
+        }
+    }
+
+    const auto& row = kSimdOpcodeTable[opcode2];
+    const auto [length, instrId] =
+        DecodeSimdRow(row, slot_index, rex_w, modrm, modrm_len);
+    if (length >= 0xE0) {
+        return { length, instrId };
+    }
+    // The full encoding (prefixes, opcode bytes, ModR/M, SIB/displacement and
+    // any trailing immediate) must be in-buffer before success, mirroring the
+    // x86 modrm-with-immediate contract and rejecting truncated displacements.
+    if (buffer.size() < static_cast<size_t>(prefix_info.length) + length) {
+        return ERR_INSUFFICIENT_BUFFER;
+    }
+    return { static_cast<uint8_t>(prefix_info.length + length), instrId };
+}
+
 static constexpr std::array<DecodeTableEntry, 256> kDecodeTable_2byte_opcode_shared{ {
     /*
        0xE1 = valid 0x0F opcode space but decode path is not implemented yet.
@@ -1399,26 +2005,25 @@ static constexpr std::array<DecodeTableEntry, 256> kDecodeTable_2byte_opcode_sha
        0x62 = 0F 18 group 16.
        0x63 = 0F opcode-extension dispatch (currently 0F BA).
        0x64 = 0F C3 /r MOVNTI.
-       0x65 = minimal SIMD ModR/M path.
-       0x66 = SIMD arithmetic families with prefix remap.
+       0x65/0x66 = SIMD rows dispatched through kSimdOpcodeTable + DecodeSimd2Byte.
     */
     /*       0                                    1                                 2                                 3                              4                                    5                                 6                                 7                                 8                              9                                    A                                 B                              C                                    D                                 E                                 F                              */
     /* 00 */ DTE(0x5E, IID_INVALID),        DTE(0x5F, IID_INVALID),        DTE(0x57, IID(LAR, r32, r16)), DTE(0x57, IID(LSL, r32, r16)), DTE(0xE1, IID_INVALID),        DTE(0x02, IID(SYSCALL)), DTE(0x02, IID(CLTS)),    DTE(0x02, IID(SYSRET)),  DTE(0x02, IID(INVD)),    DTE(0x02, IID(WBINVD)),  DTE(0xE1, IID_INVALID),        DTE(0x02, IID(UD)),      DTE(0xE1, IID_INVALID),        DTE(0x62, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),
-    /* 10 */ DTE(0x65, IID(MOVUPS)),        DTE(0x65, IID(MOVUPS)),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x62, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x62, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x62, IID_INVALID),        DTE(0x5A, IID(NOP)),
-    /* 20 */ DTE(0x60, IID(MOV, r64, creg)), DTE(0x60, IID(MOV, r64, dr)),   DTE(0x60, IID(MOV, creg, r64)), DTE(0x60, IID(MOV, dr, r64)),   DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x65, IID(MOVAPS)),        DTE(0x65, IID(MOVAPS)),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x65, IID(UCOMISS)),       DTE(0x65, IID(COMISS)),
+    /* 10 */ DTE(0x65, IID(MOVUPS)),        DTE(0x65, IID(MOVUPS)),        DTE(0x66, IID(MOVHLPS)),       DTE(0x66, IID(MOVLPS)),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x66, IID(MOVLHPS)),       DTE(0x66, IID(MOVHPS)),        DTE(0x62, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x62, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x62, IID_INVALID),        DTE(0x5A, IID(NOP)),
+    /* 20 */ DTE(0x60, IID(MOV, r64, creg)), DTE(0x60, IID(MOV, r64, dr)),   DTE(0x60, IID(MOV, creg, r64)), DTE(0x60, IID(MOV, dr, r64)),   DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x65, IID(MOVAPS)),        DTE(0x65, IID(MOVAPS)),        DTE(0x66, IID(CVTSI2SS)),      DTE(0xE1, IID_INVALID),        DTE(0x66, IID(CVTTSS2SI)),     DTE(0x66, IID(CVTSS2SI)),      DTE(0x65, IID(UCOMISS)),       DTE(0x65, IID(COMISS)),
     /* 30 */ DTE(0x02, IID(WRMSR)),         DTE(0x02, IID(RDTSC)),          DTE(0x02, IID(RDMSR)),          DTE(0x02, IID(RDPMC)),          DTE(0x02, IID(SYSENTER)),       DTE(0x02, IID(SYSEXIT)),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),
     /* 40 */ DTE(0x00, IID(CMOVO, Gv_Ev)),  DTE(0x00, IID(CMOVNO, Gv_Ev)), DTE(0x00, IID(CMOVB, Gv_Ev)),  DTE(0x00, IID(CMOVAE, Gv_Ev)), DTE(0x00, IID(CMOVZ, Gv_Ev)),  DTE(0x00, IID(CMOVNZ, Gv_Ev)), DTE(0x00, IID(CMOVBE, Gv_Ev)), DTE(0x00, IID(CMOVA,  Gv_Ev)), DTE(0x00, IID(CMOVS,  Gv_Ev)), DTE(0x00, IID(CMOVNS, Gv_Ev)), DTE(0x00, IID(CMOVP,  Gv_Ev)), DTE(0x00, IID(CMOVNP, Gv_Ev)), DTE(0x00, IID(CMOVL,  Gv_Ev)), DTE(0x00, IID(CMOVGE, Gv_Ev)), DTE(0x00, IID(CMOVLE, Gv_Ev)), DTE(0x00, IID(CMOVG,  Gv_Ev)),
-    /* 50 */ DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x66, IID(ADDPS)),         DTE(0x66, IID(MULPS)),         DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x66, IID(SUBPS)),         DTE(0xE1, IID_INVALID),        DTE(0x66, IID(DIVPS)),         DTE(0xE1, IID_INVALID),
-    /* 60 */ DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),
-    /* 70 */ DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x02, IID(EMMS)),          DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),
+    /* 50 */ DTE(0x66, IID(MOVMSKPS)),      DTE(0x66, IID(SQRTPS)),        DTE(0x66, IID(RSQRTPS)),       DTE(0x66, IID(RCPPS)),         DTE(0x66, IID(ANDPS)),         DTE(0x66, IID(ANDNPS)),        DTE(0x66, IID(ORPS)),          DTE(0x66, IID(XORPS)),         DTE(0x66, IID(ADDPS)),         DTE(0x66, IID(MULPS)),         DTE(0x66, IID(CVTPS2PD)),      DTE(0x66, IID(CVTDQ2PS)),      DTE(0x66, IID(SUBPS)),         DTE(0x66, IID(MINPS)),         DTE(0x66, IID(DIVPS)),         DTE(0x66, IID(MAXPS)),
+    /* 60 */ DTE(0x66, IID(PUNPCKLBW)),     DTE(0x66, IID(PUNPCKLWD)),     DTE(0x66, IID(PUNPCKLDQ)),     DTE(0x66, IID(PACKSSWB)),      DTE(0x66, IID(PCMPGTB)),       DTE(0x66, IID(PCMPGTW)),       DTE(0x66, IID(PCMPGTD)),       DTE(0x66, IID(PACKUSWB)),      DTE(0x66, IID(PUNPCKHBW)),     DTE(0x66, IID(PUNPCKHWD)),     DTE(0x66, IID(PUNPCKHDQ)),     DTE(0x66, IID(PACKSSDW)),      DTE(0x66, IID(PUNPCKLQDQ)),    DTE(0x66, IID(PUNPCKHQDQ)),    DTE(0x66, IID(MOVD)),          DTE(0x66, IID(MOVDQA)),
+    /* 70 */ DTE(0x66, IID(PSHUFD)),        DTE(0x66, IID(PSRLW)),         DTE(0x66, IID(PSRLD)),         DTE(0x66, IID(PSRLQ)),         DTE(0x66, IID(PCMPEQB)),       DTE(0x66, IID(PCMPEQW)),       DTE(0x66, IID(PCMPEQD)),       DTE(0x02, IID(EMMS)),          DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x66, IID(HADDPD)),        DTE(0x66, IID(HSUBPD)),        DTE(0x66, IID(MOVD)),          DTE(0x66, IID(MOVDQA)),
     /* 80 */ DTE(0x06, IID(JO, rel32)),     DTE(0x06, IID(JNO, rel32)),    DTE(0x06, IID(JB, rel32)),     DTE(0x06, IID(JAE, rel32)),    DTE(0x06, IID(JZ, rel32)),     DTE(0x06, IID(JNZ, rel32)),    DTE(0x06, IID(JBE, rel32)),    DTE(0x06, IID(JA,  rel32)),    DTE(0x06, IID(JS,  rel32)),    DTE(0x06, IID(JNS, rel32)),    DTE(0x06, IID(JP,  rel32)),    DTE(0x06, IID(JNP, rel32)),    DTE(0x06, IID(JL,  rel32)),    DTE(0x06, IID(JGE, rel32)),    DTE(0x06, IID(JLE, rel32)),    DTE(0x06, IID(JG,  rel32)),
     /* 90 */ DTE(0x58, IID(SETO, r8)),      DTE(0x58, IID(SETNO, r8)),     DTE(0x58, IID(SETB, r8)),      DTE(0x58, IID(SETAE, r8)),     DTE(0x58, IID(SETZ, r8)),      DTE(0x58, IID(SETNZ, r8)),     DTE(0x58, IID(SETBE, r8)),     DTE(0x58, IID(SETA, r8)),      DTE(0x58, IID(SETS, r8)),      DTE(0x58, IID(SETNS, r8)),     DTE(0x58, IID(SETP, r8)),      DTE(0x58, IID(SETNP, r8)),     DTE(0x58, IID(SETL, r8)),      DTE(0x58, IID(SETGE, r8)),     DTE(0x58, IID(SETLE, r8)),     DTE(0x58, IID(SETG, r8)),
     /* A0 */ DTE(0x02, IID(PUSH, fs)),      DTE(0x02, IID(POP, fs)),       DTE(0x02, IID(CPUID, noopr)),  DTE(0x00, IID(BT, Ev_Gv)),     DTE(0x5B, IID(SHLD, Ev_Gv, imm8)), DTE(0x5C, IID(SHLD, Ev_Gv, cl)), DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x02, IID(PUSH, gs)),      DTE(0x02, IID(POP, gs)),       DTE(0x02, IID(RSM)),           DTE(0x00, IID(BTS, Ev_Gv)),    DTE(0x5B, IID(SHRD, Ev_Gv, imm8)), DTE(0x5C, IID(SHRD, Ev_Gv, cl)), DTE(0x5D, IID_INVALID),        DTE(0x00, IID(IMUL, Gv_Ev)),
     /* B0 */ DTE(0x00, IID(CMPXCHG, Eb_Gb)), DTE(0x00, IID(CMPXCHG, Ev_Gv)), DTE(0x00, IID(LSS, Gv_M)),     DTE(0x00, IID(BTR, Ev_Gv)),    DTE(0x00, IID(LFS, Gv_M)),     DTE(0x00, IID(LGS, Gv_M)),     DTE(0x56, IID(MOVZX, r32, r8)), DTE(0x57, IID(MOVZX, r32, r16)), DTE(0x00, IID(POPCNT, Gv_Ev)), DTE(0xE1, IID_INVALID),        DTE(0x63, IID_INVALID),        DTE(0x00, IID(BTC, Ev_Gv)),    DTE(0x00, IID(BSF, Gv_Ev)),    DTE(0x00, IID(BSR, Gv_Ev)),    DTE(0x56, IID(MOVSX, r32, r8)), DTE(0x57, IID(MOVSX, r32, r16)),
-    /* C0 */ DTE(0x00, IID(XADD, Eb_Gb)),    DTE(0x00, IID(XADD, Ev_Gv)),    DTE(0xE1, IID_INVALID),        DTE(0x64, IID(MOVNTI, m32, r32)), DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x61, IID_INVALID),        DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),
-    /* D0 */ DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),
-    /* E0 */ DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),
-    /* F0 */ DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xD6, IID_INVALID),
+    /* C0 */ DTE(0x00, IID(XADD, Eb_Gb)),    DTE(0x00, IID(XADD, Ev_Gv)),    DTE(0x66, IID(CMPPS)),         DTE(0x64, IID(MOVNTI, m32, r32)), DTE(0x66, IID(PINSRW)),        DTE(0x66, IID(PEXTRW)),        DTE(0x66, IID(SHUFPS)),        DTE(0x61, IID_INVALID),        DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),    DTE(0x59, IID(BSWAP, r32)),
+    /* D0 */ DTE(0x66, IID(ADDSUBPS)),      DTE(0x66, IID(PSRLW)),         DTE(0x66, IID(PSRLD)),         DTE(0x66, IID(PSRLQ)),         DTE(0x66, IID(PADDQ)),         DTE(0x66, IID(PMULLW)),        DTE(0x66, IID(MOVQ)),          DTE(0x66, IID(PMOVMSKB)),      DTE(0x66, IID(PSUBUSB)),       DTE(0x66, IID(PSUBUSW)),       DTE(0x66, IID(PMINUB)),        DTE(0x66, IID(PAND)),          DTE(0x66, IID(PADDUSB)),       DTE(0x66, IID(PADDUSW)),       DTE(0x66, IID(PMAXUB)),        DTE(0x66, IID(PANDN)),
+    /* E0 */ DTE(0x66, IID(PAVGB)),         DTE(0x66, IID(PSRAW)),         DTE(0x66, IID(PSRAD)),         DTE(0x66, IID(PAVGW)),         DTE(0x66, IID(PMULHUW)),       DTE(0x66, IID(PMULHW)),        DTE(0x66, IID(CVTPD2DQ)),      DTE(0x66, IID(MOVNTDQ)),       DTE(0x66, IID(PSUBSB)),        DTE(0x66, IID(PSUBSW)),        DTE(0x66, IID(PMINSW)),        DTE(0x66, IID(POR)),           DTE(0x66, IID(PADDSB)),        DTE(0x66, IID(PADDSW)),        DTE(0x66, IID(PMAXSW)),        DTE(0x66, IID(PXOR)),
+    /* F0 */ DTE(0x66, IID(LDDQU)),         DTE(0x66, IID(PSLLW)),         DTE(0x66, IID(PSLLD)),         DTE(0x66, IID(PSLLQ)),         DTE(0x66, IID(PMULUDQ)),       DTE(0x66, IID(PMADDWD)),       DTE(0x66, IID(PSADBW)),        DTE(0x66, IID(MASKMOVDQU)),    DTE(0x66, IID(PSUBB)),         DTE(0x66, IID(PSUBW)),         DTE(0x66, IID(PSUBD)),         DTE(0x66, IID(PSUBQ)),         DTE(0x66, IID(PADDB)),         DTE(0x66, IID(PADDW)),         DTE(0x66, IID(PADDD)),         DTE(0xD6, IID_INVALID),
 } };
 
 } // namespace detail
