@@ -52,24 +52,24 @@ cmake --build build_ninja --target xendiza_bench
 # A single raw-bytes file (e.g. your own .text dump)
 ./xendiza_bench.exe --file path/to/code.bin [--iters N]
 
-# One or more bundled fixtures (real system-DLL .text sections)
+# One or more bundled fixtures
 ./xendiza_bench.exe --fixture ntdll [--fixture kernelbase] [--iters N]
+
+# SIMD-heavy OpenSSL .text slice
+./xendiza_bench.exe --fixture openssl-simd --iters 30
 ```
 
 Corpus source priority: `--file` > `--fixture` (concatenated) > synthetic seed.
 
 ## Fixtures
 
-Real `.text` sections extracted from Windows system DLLs via
-`bench/fixtures/extract_text.py` (zero-dependency minimal PE parser). See
-`bench/fixtures/README.md` for provenance, SHA256, and re-extraction
-instructions.
+The bundled fixtures include Windows system DLL `.text` sections and a
+SIMD-heavy OpenSSL `.text` slice. See [the fixture documentation](fixtures/README.md)
+for instruction counts, provenance, hashes, and extraction instructions.
 
-The fixtures contain a realistic mix of legacy + SSE + AVX instructions. xendiza
-reports a non-zero `errors` count on them because it does not cover AVX/SSE
-(unsupported opcodes trigger the `++off` byte-resync path). **This is expected
-and is exactly what the benchmark should measure**: the cost of resync in real
-code, and the net throughput advantage over Zydis (which decodes everything).
+Unsupported encodings such as AVX trigger the `++off` resynchronization path.
+The OpenSSL fixture measures a mixed workload of supported decode and
+resynchronization on SIMD-heavy code.
 
 ## Results
 

@@ -1,9 +1,7 @@
 # Benchmark Fixtures
 
-Real `.text` sections extracted from Windows system DLLs, used by
-`xendiza_bench` to measure decode throughput on realistic instruction mixes
-(containing SSE/AVX/AVX-512 bytes that xendiza does **not** cover, exercising
-the `++off` resync slow path).
+Raw x86-64 code from PE `.text` sections. The Windows system DLLs provide
+general-purpose workloads. The OpenSSL fixture provides a SIMD-heavy workload.
 
 ## Files
 
@@ -13,7 +11,39 @@ the `++off` resync slow path).
 | `kernelbase.text.bin` | `C:\Windows\System32\kernelbase.dll` | 1,724,416 | `0x1000` | `8e8499fc...c07c` | `05b4a1ab...014a` |
 | `kernel32.text.bin` | `C:\Windows\System32\kernel32.dll` | 544,768 | `0x1000` | `26410f49...c341` | `17943503...6031` |
 
-**Total: 3,751,936 bytes (~3.58 MiB) of real x86-64 code.**
+**Windows DLL total: 3,751,936 bytes (~3.58 MiB).**
+
+## OpenSSL SIMD fixture
+
+`openssl-simd.text.bin` contains 131,074 bytes from the x86-64 MSYS2
+`libopenssl` package version `3.6.4-1` (`usr/bin/msys-crypto-3.dll`).
+It is the contiguous `.text` slice `[0x260000, 0x280002)` at RVA `0x261000`.
+The slice was selected for its SIMD density, with endpoints aligned to
+instruction boundaries in the reference linear decode.
+
+| Capstone 5.0.5 instruction groups | Count | Share of decoded instructions |
+|---|---:|---:|
+| All decoded instructions | 31,564 | 100% |
+| SSE family (including SSSE3) | 5,596 | 17.7% |
+| AVX or AVX2 | 7,951 | 25.2% |
+| AVX2 (included above) | 3,357 | 10.6% |
+
+The linear decode skipped 5 bytes. Source DLL SHA256 is
+`318a5ff40425f08f2b740649f9afe40b28af270c70a2253df924aaee49bc2548`.
+Fixture SHA256 is
+`579bfb582c76f03ed5a50b99337fbb0a79bd46fe601f68c774504712b866d671`.
+
+The fixture contains code from the OpenSSL Project under Apache-2.0.
+See the [OpenSSL 3.6.4 source](https://github.com/openssl/openssl/tree/openssl-3.6.4),
+the [OpenSSL license](https://openssl-library.org/source/license/index.html),
+and the [MSYS2 package](https://packages.msys2.org/packages/libopenssl).
+
+To reproduce it, verify the input DLL hash and run the following from
+`bench/fixtures` with the path to that DLL.
+
+```sh
+python -c "from pathlib import Path; from extract_text import read_pe_text_section; import sys; text, _, _ = read_pe_text_section(Path(sys.argv[1])); Path('openssl-simd.text.bin').write_bytes(text[0x260000:0x280002])" path/to/msys-crypto-3.dll
+```
 
 ## Provenance
 
@@ -57,8 +87,7 @@ advantage in three ways:
    dispatch in `Disasm` trivially predictable (~100% hit rate).
 3. **Cache cheating** — the working set stays inside L1.
 
-Real `.text` sections contain a representative mix of legacy + SSE + AVX
-instructions, so xendiza will report a non-zero `errors` count (every AVX/SSE
-byte sequence triggers resync). This is **expected and is exactly what the
-benchmark should measure**: the cost of the resync path in real code, and the
-net throughput advantage (if any) over Zydis, which decodes everything.
+The fixtures include supported legacy and SSE encodings alongside unsupported
+encodings such as AVX. On unsupported input, xendiza increments `errors` and
+tries again one byte later. The throughput therefore includes resynchronization,
+and the error count measures failed decode attempts.
