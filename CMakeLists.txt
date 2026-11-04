@@ -50,6 +50,7 @@ add_executable(xendiza_tests
     test/test_sse_m2.cpp
     test/test_sse_m3.cpp
     test/test_sse_m4.cpp
+    test/test_x86_x64_0f38_0f3a.cpp
     test/test_perf_regression.cpp
 )
 

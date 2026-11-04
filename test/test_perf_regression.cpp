@@ -207,6 +207,53 @@ static constexpr std::array<uint8_t, 51> kSeedExtM4 = {
     0xF2, 0x0F, 0xF0, 0x00,             // lddqu xmm, m128 ([rax])
 };
 
+// M5b: 0F 38 three-byte rows with opcode3-spread representatives (00/04/10/
+// 20/31/37/2A/40/DB/DC per the change design Decision 5 style) plus the shared
+// MOVBE/CRC32 F0/F1 rows in their prefix forms. The initializer must list
+// exactly 74 bytes. The frozen kSeed/kSeedExt and M1-M4 tiles stay untouched;
+// this tile feeds only the independent M5b guards below.
+static constexpr std::array<uint8_t, 74> kSeedExtM5b = {
+    0x66, 0x0F, 0x38, 0x00, 0x00,       // pshufb xmm, m128 ([rax])
+    0x66, 0x0F, 0x38, 0x04, 0xC1,       // pmaddubsw xmm, xmm
+    0x66, 0x0F, 0x38, 0x10, 0x00,       // pblendvb xmm, m128 ([rax])
+    0x66, 0x0F, 0x38, 0x20, 0x00,       // pmovsxbw xmm, m64 ([rax])
+    0x66, 0x0F, 0x38, 0x31, 0x00,       // pmovzxbd xmm, m32 ([rax])
+    0x66, 0x0F, 0x38, 0x37, 0xC1,       // pcmpgtq xmm, xmm
+    0x66, 0x0F, 0x38, 0x2A, 0x00,       // movntdqa xmm, m128 ([rax])
+    0x66, 0x0F, 0x38, 0x40, 0x00,       // pmulld xmm, m128 ([rax])
+    0x66, 0x0F, 0x38, 0xDB, 0xC1,       // aesimc xmm, xmm
+    0x66, 0x0F, 0x38, 0xDC, 0x00,       // aesenc xmm, m128 ([rax])
+    0x0F, 0x38, 0xF0, 0x00,             // movbe r32, m32 ([rax])
+    0x0F, 0x38, 0xF1, 0x00,             // movbe m32, r32 ([rax])
+    0xF2, 0x0F, 0x38, 0xF0, 0x00,       // crc32 r32, m8 ([rax])
+    0xF2, 0x0F, 0x38, 0xF1, 0xC1,       // crc32 r32, r32
+    0x66, 0xF2, 0x0F, 0x38, 0xF1, 0x00, // crc32 r32, m16 ([rax])
+};
+
+// M5a: 0F 3A three-byte rows with opcode3-spread representatives (08/0A/0C/
+// 0F/14/15/16/17/20/21/22/40/42/44/60/61/DF per the change design checklist)
+// — every defined 0F 3A row carries a trailing imm8. The initializer must
+// list exactly 102 bytes; this tile feeds only the independent M5a guards.
+static constexpr std::array<uint8_t, 102> kSeedExtM5a = {
+    0x66, 0x0F, 0x3A, 0x08, 0x00, 0x14, // roundps xmm, m128, 0x14
+    0x66, 0x0F, 0x3A, 0x0A, 0x00, 0x14, // roundss xmm, m32, 0x14
+    0x66, 0x0F, 0x3A, 0x0C, 0xC1, 0x14, // blendps xmm, xmm, 0x14
+    0x66, 0x0F, 0x3A, 0x0F, 0x00, 0x02, // palignr xmm, m128, 2
+    0x66, 0x0F, 0x3A, 0x14, 0xC1, 0x03, // pextrb r32, xmm, 3
+    0x66, 0x0F, 0x3A, 0x15, 0x00, 0x03, // pextrw m16, xmm, 3
+    0x66, 0x0F, 0x3A, 0x16, 0x00, 0x03, // pextrd m32, xmm, 3
+    0x66, 0x0F, 0x3A, 0x17, 0xC1, 0x03, // extractps r32, xmm, 3
+    0x66, 0x0F, 0x3A, 0x20, 0x00, 0x03, // pinsrb xmm, m8, 3
+    0x66, 0x0F, 0x3A, 0x21, 0x00, 0x03, // insertps xmm, m32, 3
+    0x66, 0x0F, 0x3A, 0x22, 0x00, 0x03, // pinsrd xmm, m32, 3
+    0x66, 0x0F, 0x3A, 0x40, 0x00, 0x11, // dpps xmm, m128, 0x11
+    0x66, 0x0F, 0x3A, 0x42, 0xC1, 0x11, // mpsadbw xmm, xmm, 0x11
+    0x66, 0x0F, 0x3A, 0x44, 0x00, 0x00, // pclmulqdq xmm, m128, 0
+    0x66, 0x0F, 0x3A, 0x60, 0x00, 0x11, // pcmpestrm xmm, m128, 0x11
+    0x66, 0x0F, 0x3A, 0x61, 0xC1, 0x11, // pcmpestri xmm, xmm, 0x11
+    0x66, 0x0F, 0x3A, 0xDF, 0x00, 0x11, // aeskeygenassist xmm, m128, 0x11
+};
+
 // Tile the legacy seed + extension until the corpus is at least `min_bytes`
 // long. One pattern period is kSeed.size() + kSeedExt.size() bytes, so the
 // sweep stays periodically aligned.
@@ -393,6 +440,47 @@ auto NaiveDecodeLength(const gsl::span<const uint8_t> code) -> unsigned
         case 0xC8: case 0xC9: case 0xCA: case 0xCB: // bswap r32
         case 0xCC: case 0xCD: case 0xCE: case 0xCF:
             break;
+        case 0x38: case 0x3A: {
+            // Three-byte escape (M5 tiles only): the third opcode byte picks
+            // the tile subset; anything else is undefined. Lengths mirror the
+            // library's (+1 opcode3 byte, ModR/M/SIB/disp + trailing imm8).
+            if (i >= code.size()) {
+                return 0xE0;
+            }
+            const uint8_t op3 = code[i];
+            ++i;
+            if (op2 == 0x38) {
+                switch (op3) {
+                case 0x00: case 0x04: case 0x10: // pshufb, pmaddubsw, pblendvb
+                case 0x20: case 0x31:            // pmovsxbw, pmovzxbd
+                case 0x37: case 0x40:            // pcmpgtq, pmulld
+                case 0x2A:                       // movntdqa
+                case 0xDB: case 0xDC:            // aesimc, aesenc
+                    has_modrm = true;
+                    break;
+                case 0xF0:                       // movbe / crc32 r/m8 (F2)
+                case 0xF1:                       // movbe / crc32 (F2; 66 → r/m16)
+                    has_modrm = true;
+                    break;
+                default:
+                    return 0xE0;
+                }
+            } else {
+                switch (op3) {
+                case 0x08: case 0x0A: case 0x0C: case 0x0F: // round*, blend, palignr
+                case 0x14: case 0x15: case 0x16: case 0x17: // pextr*, extractps
+                case 0x20: case 0x21: case 0x22:            // pinsrb, insertps, pinsrd
+                case 0x40: case 0x42: case 0x44:            // dpps, mpsadbw, pclmulqdq
+                case 0x60: case 0x61: case 0xDF:            // pcmpestr*, aeskeygenassist
+                    imm = 1;
+                    has_modrm = true;
+                    break;
+                default:
+                    return 0xE0;
+                }
+            }
+            break;
+        }
         default:
             return 0xE0;
         }
@@ -692,6 +780,159 @@ TEST(PerfRegression, MilestoneRelativeThroughputGuard)
 
     const double ratio = (ref_mibs > 0.0) ? xendiza_mibs / ref_mibs : 0.0;
     const double min_ratio = GetEnvPositiveDouble("XENDIZA_PERF_MILESTONE_MIN_RATIO", kMilestoneMinRatio);
+    EXPECT_GE(ratio, min_ratio)
+        << "xendiza/naive ratio " << ratio << " (xendiza " << xendiza_mibs
+        << " MiB/s, naive " << ref_mibs << " MiB/s) is below the floor " << min_ratio;
+}
+
+// ── M5a/M5b guards (add-0f38-0f3a-support design Decision 5) ─────────────
+// Independent milestone seeds and guards for the three-byte opcode space: the
+// frozen kSeed/kSeedExt and the M1-M4 tiles/constants above stay untouched.
+// Each M5 guard runs its own corpus (legacy tiles + its own extension tile),
+// carries its own anchors, and is recalibrated from a real Release run like
+// the M1-M4 guards.
+
+// M5b anchors: corpus = kSeed + kSeedExt + kSeedExtM5b (221-byte pattern
+// period, corpus size 1,048,645 bytes) tiled to >= 1 MiB, derived from an
+// actual Release run of this suite. Re-derive whenever the M5b tile is
+// appended.
+constexpr uint64_t kMilestoneM5bExpectedDecoded = 317915;
+constexpr uint64_t kMilestoneM5bExpectedChecksum = 1537380;
+// M5b Release calibration (baseline machine): xendiza ~62-65 MiB/s, naive
+// ~747 MiB/s, ratio ~0.0876; floors kept at ~53%/63% of the measured values.
+static constexpr double kMilestoneM5bMinMiBPerSec = 35.0;
+static constexpr double kMilestoneM5bMinRatio = 0.055;
+
+TEST(PerfRegression, MilestoneM5bThroughputGuard)
+{
+#ifndef NDEBUG
+    GTEST_SKIP() << "Performance regression guard is skipped in Debug builds";
+#endif
+
+    const auto corpus = BuildMilestoneCorpus(1024 * 1024, kSeedExtM5b);
+
+    constexpr uint32_t kWarmupIters = 1;
+    constexpr uint32_t kTimedIters = 5;
+
+    uint64_t decoded = 0;
+    uint64_t checksum = 0;
+    const double best_mibs = MeasureThroughput(corpus, kWarmupIters, kTimedIters, decoded, checksum);
+
+    EXPECT_EQ(decoded, kMilestoneM5bExpectedDecoded)
+        << "Decoded-instruction count changed; the perf measurement may be invalid";
+    EXPECT_EQ(checksum, kMilestoneM5bExpectedChecksum)
+        << "Decode checksum changed; lengths or operand counts may be wrong";
+
+    const double min_mibs = GetEnvPositiveDouble("XENDIZA_PERF_M5B_MIN_MIBS", kMilestoneM5bMinMiBPerSec);
+    EXPECT_GE(best_mibs, min_mibs)
+        << "Throughput " << best_mibs << " MiB/s is below the floor " << min_mibs << " MiB/s";
+}
+
+TEST(PerfRegression, MilestoneM5bRelativeThroughputGuard)
+{
+#ifndef NDEBUG
+    GTEST_SKIP() << "Performance regression guard is skipped in Debug builds";
+#endif
+
+    const auto corpus = BuildMilestoneCorpus(1024 * 1024, kSeedExtM5b);
+
+    constexpr uint32_t kWarmupIters = 1;
+    constexpr uint32_t kTimedIters = 5;
+
+    uint64_t decoded = 0;
+    uint64_t checksum = 0;
+    const double xendiza_mibs = MeasureThroughput(corpus, kWarmupIters, kTimedIters, decoded, checksum);
+
+    EXPECT_EQ(decoded, kMilestoneM5bExpectedDecoded)
+        << "Decoded-instruction count changed; the perf measurement may be invalid";
+    EXPECT_EQ(checksum, kMilestoneM5bExpectedChecksum)
+        << "Decode checksum changed; lengths or operand counts may be wrong";
+
+    uint64_t ref_decoded = 0;
+    uint64_t ref_covered = 0;
+    const double ref_mibs = MeasureReferenceThroughput(corpus, kWarmupIters, kTimedIters,
+                                                       ref_decoded, ref_covered);
+
+    EXPECT_EQ(ref_decoded, kMilestoneM5bExpectedDecoded)
+        << "Naive reference decoded a different instruction count; the ratio is meaningless";
+    EXPECT_EQ(ref_covered, static_cast<uint64_t>(corpus.size()))
+        << "Naive reference did not cover the corpus exactly; the ratio is meaningless";
+
+    const double ratio = (ref_mibs > 0.0) ? xendiza_mibs / ref_mibs : 0.0;
+    const double min_ratio = GetEnvPositiveDouble("XENDIZA_PERF_M5B_MIN_RATIO", kMilestoneM5bMinRatio);
+    EXPECT_GE(ratio, min_ratio)
+        << "xendiza/naive ratio " << ratio << " (xendiza " << xendiza_mibs
+        << " MiB/s, naive " << ref_mibs << " MiB/s) is below the floor " << min_ratio;
+}
+
+// M5a anchors: corpus = kSeed + kSeedExt + kSeedExtM5a (249-byte pattern
+// period, corpus size 1,048,599 bytes) tiled to >= 1 MiB, derived from an
+// actual Release run of this suite. Re-derive whenever the M5a tile is
+// appended.
+constexpr uint64_t kMilestoneM5aExpectedDecoded = 290628;
+constexpr uint64_t kMilestoneM5aExpectedChecksum = 1571076;
+// M5a Release calibration (baseline machine): xendiza ~64-66 MiB/s, naive
+// ~697 MiB/s, ratio ~0.093; floors kept at ~53%/59% of the measured values.
+static constexpr double kMilestoneM5aMinMiBPerSec = 35.0;
+static constexpr double kMilestoneM5aMinRatio = 0.055;
+
+TEST(PerfRegression, MilestoneM5aThroughputGuard)
+{
+#ifndef NDEBUG
+    GTEST_SKIP() << "Performance regression guard is skipped in Debug builds";
+#endif
+
+    const auto corpus = BuildMilestoneCorpus(1024 * 1024, kSeedExtM5a);
+
+    constexpr uint32_t kWarmupIters = 1;
+    constexpr uint32_t kTimedIters = 5;
+
+    uint64_t decoded = 0;
+    uint64_t checksum = 0;
+    const double best_mibs = MeasureThroughput(corpus, kWarmupIters, kTimedIters, decoded, checksum);
+
+    EXPECT_EQ(decoded, kMilestoneM5aExpectedDecoded)
+        << "Decoded-instruction count changed; the perf measurement may be invalid";
+    EXPECT_EQ(checksum, kMilestoneM5aExpectedChecksum)
+        << "Decode checksum changed; lengths or operand counts may be wrong";
+
+    const double min_mibs = GetEnvPositiveDouble("XENDIZA_PERF_M5A_MIN_MIBS", kMilestoneM5aMinMiBPerSec);
+    EXPECT_GE(best_mibs, min_mibs)
+        << "Throughput " << best_mibs << " MiB/s is below the floor " << min_mibs << " MiB/s";
+}
+
+TEST(PerfRegression, MilestoneM5aRelativeThroughputGuard)
+{
+#ifndef NDEBUG
+    GTEST_SKIP() << "Performance regression guard is skipped in Debug builds";
+#endif
+
+    const auto corpus = BuildMilestoneCorpus(1024 * 1024, kSeedExtM5a);
+
+    constexpr uint32_t kWarmupIters = 1;
+    constexpr uint32_t kTimedIters = 5;
+
+    uint64_t decoded = 0;
+    uint64_t checksum = 0;
+    const double xendiza_mibs = MeasureThroughput(corpus, kWarmupIters, kTimedIters, decoded, checksum);
+
+    EXPECT_EQ(decoded, kMilestoneM5aExpectedDecoded)
+        << "Decoded-instruction count changed; the perf measurement may be invalid";
+    EXPECT_EQ(checksum, kMilestoneM5aExpectedChecksum)
+        << "Decode checksum changed; lengths or operand counts may be wrong";
+
+    uint64_t ref_decoded = 0;
+    uint64_t ref_covered = 0;
+    const double ref_mibs = MeasureReferenceThroughput(corpus, kWarmupIters, kTimedIters,
+                                                       ref_decoded, ref_covered);
+
+    EXPECT_EQ(ref_decoded, kMilestoneM5aExpectedDecoded)
+        << "Naive reference decoded a different instruction count; the ratio is meaningless";
+    EXPECT_EQ(ref_covered, static_cast<uint64_t>(corpus.size()))
+        << "Naive reference did not cover the corpus exactly; the ratio is meaningless";
+
+    const double ratio = (ref_mibs > 0.0) ? xendiza_mibs / ref_mibs : 0.0;
+    const double min_ratio = GetEnvPositiveDouble("XENDIZA_PERF_M5A_MIN_RATIO", kMilestoneM5aMinRatio);
     EXPECT_GE(ratio, min_ratio)
         << "xendiza/naive ratio " << ratio << " (xendiza " << xendiza_mibs
         << " MiB/s, naive " << ref_mibs << " MiB/s) is below the floor " << min_ratio;
