@@ -45,38 +45,53 @@ cmd //c test/diff/build.bat         # build out/harness.exe (MSVC dev environmen
 python test/diff/compare.py         # run and report
 ```
 
-## Current results (2026-11-04, post add-sse1-sse2-support)
+## Current results (2026-11-04, post add-0f38-0f3a-support)
 
 - 425 streams / 773 expected instructions from 13 files.
-- Agreement: **90.7%** of comparable instructions (baseline before the SSE
-  change: 89.9%); Zydis vectors 53/56. Delta drivers: the legacy SSE1/SSE2
-  scope gaps closed (`MOVSD F2 0F 10`, `MOVQ 66 0F D6`, `PMOVMSKB`, packed
-  block rows), plus harness mnemonic-name completion.
+- Agreement: **91.9%** of comparable instructions (baseline before the
+  three-byte change: 90.7%); Zydis vectors 53/56. Delta drivers: the three-byte
+  scope gaps closed — the full CRC32 family (20 vectors incl. the REX.W r64
+  forms and the `66 F2` r/m16 halfword form), `66 0F 38` PHADDSW, the no-`F2`
+  MOVBE vector, and POPCNT harness naming — now match the external decoders.
 - Remaining deltas classify into:
   - **By design** (unit-tested in `test/`): legacy-invalid opcodes in 32-bit
-    mode (POP/PUSH segreg, PUSHA/POPA, INTO), MOV CR/DR memory forms,
-    strict duplicate/mandatory-prefix rejection (capstone's
-    `x86-mandatory-prefixes.yaml` expects last-prefix-wins for `66`+`F2`/`F3`
-    mixes; xendiza returns undefined-instruction), MMX strict rejection
-    (packed-integer opcodes without the mandatory `66h` and MMX-operand
-    variants such as `F2/F3 0F D6` and REX+MMX `0F 6E/7E` decode
-    `UNDEFINED_INSTRUCTION`), F2-prefixed `0F BC/BD` decoded as BSF/BSR
-    (Intel ignores `F2` there; capstone expects `LZCNT`/`TZCNT` — xendiza
-    follows the SDM), capstone aliasing `66 0F D6` to `MOV` (xendiza reports
-    the SDM mnemonic `MOVQ`), string instructions without explicit operands,
-    and 64-bit near branches keeping `rel32` under the `0x66` prefix (Intel
-    ignores the prefix there; see below).
-  - **Scope gaps**: three-byte opcodes `0F 38`/`0F 3A` (`CRC32`,
-    `PHADDSW`, SSSE3/SSE4.x), reserved-NOP forms `0F 19-1B/1D` (capstone
-    reports `NOP`), VEX/EVEX (zydis EVEX fuzzer case), and the capstone
-    `48 A1` stream quirk (expects `imm64` operand naming for `moffs64`).
-    AVX files are excluded entirely.
+    mode (POP/PUSH segreg, PUSHA/POPA, INTO), MOV CR/DR memory forms (incl.
+    the REP-prefixed variants), strict duplicate/mandatory-prefix rejection
+    (capstone's `x86-mandatory-prefixes.yaml` expects last-prefix-wins for
+    `66`+`F2`/`F3` mixes; xendiza returns undefined-instruction), MMX strict
+    rejection (packed-integer opcodes without the mandatory `66h` — incl. the
+    `0F 38` SSSE3 rows, which now decode `UNDEFINED_INSTRUCTION` after the
+    three-byte dispatch instead of the previous unimplemented marker — and
+    MMX-operand variants such as `F2/F3 0F D6` and REX+MMX `0F 6E/7E`),
+    F2-prefixed `0F BC/BD` decoded as BSF/BSR (Intel ignores `F2` there;
+    capstone expects `LZCNT`/`TZCNT` — xendiza follows the SDM), capstone
+    aliasing `66 0F D6` to `MOV` (xendiza reports the SDM mnemonic `MOVQ`),
+    string instructions without explicit operands, reserved-NOP forms
+    `0F 19-1B/1D` under junk prefixes (capstone reports `NOP`), `AAM` in
+    64-bit mode (zydis fuzzer case), and 64-bit near branches keeping
+    `rel32` under the `0x66` prefix (Intel ignores the prefix there; see
+    below — the sweep-shift consequences of that divergence also surface as
+    two error lines inside longer `x86.yaml` CALL/JMP streams).
+  - **Scope gaps** (out of the covered capabilities, undefined-instruction):
+    VEX/EVEX (zydis EVEX fuzzer case; AVX files excluded entirely), the
+    far-jump group (`FF /5`, incl. `REX.W` `m16:64` — capstone/LLVM decode
+    it; xendiza does not implement far control transfer yet), ADCX/ADOX
+    (`0F 38 F6/F7`, deliberately excluded by the three-byte change and
+    pinned undefined by its suite), and the capstone `48 A1` stream quirk
+    (expects `imm64` operand naming for `moffs64`).
   - **Known upstream divergence**: capstone's `x86_jcc_mode.yaml` "DEFAULT"
     64-bit vectors expect `0x66`-prefixed Jcc to decode as `rel16`
     (AMD-style). xendiza follows the Intel SDM / Zydis default, where the
     `0x66` prefix is ignored on near branches in 64-bit mode (`rel32`,
     length includes the prefix byte). Zydis calls the capstone behavior
     `ZYDIS_DECODER_MODE_AMD_BRANCHES` and does not enable it by default.
+- Three-byte coverage note: the corpus carries `0F 38`/`0F 3A` vectors only
+  from `x86-mandatory-prefixes.yaml` (CRC32 prefix forms, MOVBE, PHADDSW
+  slot semantics) and `x86_64-encoding.s.yaml` (CRC32 r32/r64 reg+mem).
+  The SSSE3/SSE4.1/SSE4.2/AES/PCLMUL rows themselves are covered by the
+  GoogleTest suites (`test/test_x86_x64_0f38_0f3a.cpp`) against the SDM
+  enumeration rather than external vectors — the bundled Zydis/Capstone
+  corpora carry no vectors for them.
 
 ## Resolved in fix-operand16-branches-and-aam-aad
 
