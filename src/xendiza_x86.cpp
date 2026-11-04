@@ -4,48 +4,6 @@ namespace xendiza::detail {
 
 namespace {
 
-struct SimdArithmeticFamily {
-    std::array<OpcodeId, 4> by_prefix;
-};
-
-struct SimdPrefixVariant {
-    uint8_t opcode_index;
-    Operand mem_operand;
-};
-
-constexpr auto MakeSimdArithmeticFamily(
-    const OpcodeId ps, const OpcodeId pd, const OpcodeId ss, const OpcodeId sd) noexcept
-    -> SimdArithmeticFamily
-{
-    return { { ps, pd, ss, sd } };
-}
-
-// Index by second opcode byte (0x58/59/5C/5E currently used).
-// Family slots are ordered as: none, 66h, F3, F2.
-constexpr auto kSimdArithmeticFamilyByOpcode2 = [] {
-    std::array<SimdArithmeticFamily, 256> table{};
-    for (auto& item : table) {
-        item = MakeSimdArithmeticFamily(
-            OpcodeId::INVALID_OPCODE,
-            OpcodeId::INVALID_OPCODE,
-            OpcodeId::INVALID_OPCODE,
-            OpcodeId::INVALID_OPCODE);
-    }
-    table[0x58] = MakeSimdArithmeticFamily(OpcodeId::ADDPS, OpcodeId::ADDPD, OpcodeId::ADDSS, OpcodeId::ADDSD);
-    table[0x59] = MakeSimdArithmeticFamily(OpcodeId::MULPS, OpcodeId::MULPD, OpcodeId::MULSS, OpcodeId::MULSD);
-    table[0x5C] = MakeSimdArithmeticFamily(OpcodeId::SUBPS, OpcodeId::SUBPD, OpcodeId::SUBSS, OpcodeId::SUBSD);
-    table[0x5E] = MakeSimdArithmeticFamily(OpcodeId::DIVPS, OpcodeId::DIVPD, OpcodeId::DIVSS, OpcodeId::DIVSD);
-    return table;
-}();
-
-// Prefix variant index: 0=none, 1=66h, 2=F3, 3=F2.
-constexpr std::array<SimdPrefixVariant, 4> kSimdPrefixVariants = {
-    SimdPrefixVariant{ 0, Operand::m128 },
-    SimdPrefixVariant{ 1, Operand::m128 },
-    SimdPrefixVariant{ 2, Operand::m32 },
-    SimdPrefixVariant{ 3, Operand::m64 },
-};
-
 // x86-32 keeps an independent 0F-table view so per-mode semantic overrides
 // don't leak into the shared x64 decode table.
 constexpr auto kDecodeTable_1byte_opcode_32 = [] {
@@ -257,8 +215,9 @@ constexpr auto DecodeModrmWithImmediate(const PrefixInfo32& prefix_info,
         return ERR_INSUFFICIENT_BUFFER;
     }
 
+    const bool addr16 = prefix_info.has_prefix.has_67 != 0;
     const auto modrm = buffer[prefix_info.length + 1];
-    uint8_t modrm_len = kLengthTable_ModRM[modrm];
+    uint8_t modrm_len = addr16 ? kLengthTable_ModRM_Addr16[modrm] : kLengthTable_ModRM[modrm];
 
     const auto& [operand] = operand_form_table[modrm];
     const auto imm_operand = instr_id.operands.operand[1];
@@ -268,9 +227,13 @@ constexpr auto DecodeModrmWithImmediate(const PrefixInfo32& prefix_info,
         Operands{{ operand[0], operand[1], imm_operand, Operand::noopr }}
     };
 
-    // rm=100 (and mod!=11) → SIB byte follows; resolve stack markers. The
-    // mandatory disp32 (SIB.base=101) only applies at mod=00.
-    if (ModrmHasSib(modrm)) {
+    // rm=100 (and mod!=11) → SIB byte follows (32-bit addressing); resolve
+    // stack markers. The mandatory disp32 (SIB.base=101) only applies at
+    // mod=00. Under 67h there is no SIB byte: rm=100 form entries carry
+    // unresolved Sib_M* markers, resolved to the plain memory classes.
+    if (addr16) {
+        resolved_id = ResolveSibMarkers(resolved_id, 0);
+    } else if (ModrmHasSib(modrm)) {
         if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
             return ERR_INSUFFICIENT_BUFFER;
         }
@@ -425,13 +388,14 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
     }
 
     const auto opcode2 = buffer[prefix_info.length + 1];
+    const bool addr16 = prefix_info.has_prefix.has_67 != 0;
     switch (const auto [tag, instr_id] = kDecodeTable_2byte_opcode_32[opcode2]; tag.dispatch_code) {
     case 0x00: {
         if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        const uint8_t modrm_len = kLengthTable_ModRM[modrm];
+        const uint8_t modrm_len = addr16 ? kLengthTable_ModRM_Addr16[modrm] : kLengthTable_ModRM[modrm];
 
         auto resolved_id = instr_id;
         if (const auto form_index = static_cast<size_t>(resolved_id.operands.operand[0]);
@@ -445,7 +409,17 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
                 resolved_id.operand_count = 2;
             }
         }
+        // Under 67h rm=100 form entries carry unresolved SIB-dispatch markers
+        // (no SIB byte exists); resolve them to the plain memory classes.
+        if (addr16) {
+            resolved_id = ResolveSibMarkers(resolved_id, 0);
+        }
         const auto [length, instrId] = ApplyPrefixSizes32({ static_cast<uint8_t>(modrm_len + 1), resolved_id }, prefix_info);
+        // Addr16 truncation check: the full encoding (with the 16-bit
+        // displacement) must be in-buffer before reporting success.
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { static_cast<uint8_t>(prefix_info.length + length), instrId };
     }
 
@@ -469,22 +443,30 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         const auto is_reg = (modrm & 0b11'000'000) == 0b11'000'000;
         const bool has_66 = prefix_info.has_prefix.has_66 != 0;
         auto resolved_id  = instr_id;
         resolved_id.operands.operand[0] = has_66 ? Operand::r16 : Operand::r32;
         Operand src = Operand::m8;
-        if (!is_reg && (modrm & 0b00'000'111u) == 0b00'000'100u) { // rm=100 → SIB
+        if (!addr16 && !is_reg && (modrm & 0b00'000'111u) == 0b00'000'100u) { // rm=100 → SIB
             src = kSibStackForm_b[buffer[prefix_info.length + 3]];
         }
         resolved_id.operands.operand[1] = is_reg ? Operand::r8 : src;
         resolved_id.operands.operand[2] = Operand::noopr;
         resolved_id.operand_count       = 2;
         const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
+        if (addr16 && buffer.size() < static_cast<size_t>(total_len)) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { total_len, resolved_id };
     }
 
@@ -494,22 +476,30 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         const auto is_reg = (modrm & 0b11'000'000) == 0b11'000'000;
         const bool has_66 = prefix_info.has_prefix.has_66 != 0;
         auto resolved_id  = instr_id;
         resolved_id.operands.operand[0] = has_66 ? Operand::r16 : Operand::r32;
         Operand src = Operand::m16;
-        if (!is_reg && (modrm & 0b00'000'111u) == 0b00'000'100u) { // rm=100 → SIB
+        if (!addr16 && !is_reg && (modrm & 0b00'000'111u) == 0b00'000'100u) { // rm=100 → SIB
             src = kSibStackForm_w[buffer[prefix_info.length + 3]];
         }
         resolved_id.operands.operand[1] = is_reg ? Operand::r16 : src;
         resolved_id.operands.operand[2] = Operand::noopr;
         resolved_id.operand_count       = 2;
         const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
+        if (addr16 && buffer.size() < static_cast<size_t>(total_len)) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { total_len, resolved_id };
     }
 
@@ -519,9 +509,14 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         const auto is_reg = (modrm & 0b11'000'000) == 0b11'000'000;
         auto resolved_id  = instr_id;
@@ -530,6 +525,9 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
         resolved_id.operands.operand[2] = Operand::noopr;
         resolved_id.operand_count       = 1;
         const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
+        if (addr16 && buffer.size() < static_cast<size_t>(total_len)) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { total_len, resolved_id };
     }
 
@@ -550,32 +548,52 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
         if ((modrm & 0b00'111'000) != 0b00'000'000) {
             return ERR_UNDEFINED_INSTRUCTION;
         }
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
+        if (addr16 && buffer.size() < static_cast<size_t>(total_len)) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { total_len, instr_id };
     }
 
     // ModR/M-based Ev,Gv,imm8 forms (SHLD/SHRD Ev, Gv, imm8)
     case 0x5B: {
+        // The shortest encoding after the prefixes is 0F + opcode + ModR/M + imm8.
         if (buffer.size() <= static_cast<size_t>(prefix_info.length + 3)) {
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         const auto& form = kOperandFormTable_Ev_Gv[modrm];
         auto resolved_id = instr_id;
         resolved_id.operands = { { form.operand[0], form.operand[1], Operand::imm8 } };
-        if (ModrmHasSib(modrm)) {
+        if (addr16) {
+            resolved_id = ResolveSibMarkers(resolved_id, 0);
+        } else if (ModrmHasSib(modrm)) {
             resolved_id = ResolveSibMarkers(resolved_id, buffer[prefix_info.length + 3]);
         }
         const auto [length, instrId] = ApplyPrefixSizes32(
             { static_cast<uint8_t>(modrm_len + 2), resolved_id }, prefix_info);
+        // Addr16 truncation check: disp + trailing imm8 must be fully in-buffer.
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { static_cast<uint8_t>(prefix_info.length + length), instrId };
     }
 
@@ -585,18 +603,28 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         const auto& [operand] = kOperandFormTable_Ev_Gv[modrm];
         auto resolved_id = instr_id;
         resolved_id.operands = { { operand[0], operand[1], Operand::cl } };
-        if (ModrmHasSib(modrm)) {
+        if (addr16) {
+            resolved_id = ResolveSibMarkers(resolved_id, 0);
+        } else if (ModrmHasSib(modrm)) {
             resolved_id = ResolveSibMarkers(resolved_id, buffer[prefix_info.length + 3]);
         }
         const auto [length, instrId] = ApplyPrefixSizes32(
             { static_cast<uint8_t>(modrm_len + 1), resolved_id }, prefix_info);
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { static_cast<uint8_t>(prefix_info.length + length), instrId };
     }
 
@@ -606,9 +634,14 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         const bool has_66 = prefix_info.has_prefix.has_66 != 0;
 
@@ -621,6 +654,9 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
         if (result.length >= 0xE0) {
             return result;
         }
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + result.length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { static_cast<uint8_t>(prefix_info.length + result.length), result.instrId };
     }
 
@@ -630,15 +666,23 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         auto result = GetInstructionDescriptor_0F_00(modrm, modrm_len);
         if (result.length >= 0xE0) {
             return result;
         }
         const auto [length, instrId] = ApplyPrefixSizes32(result, prefix_info);
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { static_cast<uint8_t>(prefix_info.length + length), instrId };
     }
 
@@ -648,15 +692,23 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         auto result = GetInstructionDescriptor_0F_01(modrm, modrm_len);
         if (result.length >= 0xE0) {
             return result;
         }
         const auto adjusted = ApplyPrefixSizes32(result, prefix_info);
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + adjusted.length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { static_cast<uint8_t>(prefix_info.length + adjusted.length), adjusted.instrId };
     }
 
@@ -686,9 +738,14 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         auto result = GetInstructionDescriptor_0F_C7(modrm, modrm_len);
         if (result.length >= 0xE0) {
@@ -696,6 +753,9 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
         }
         // RDRAND/RDSEED carry r32; apply 66h size override if present.
         const auto [length, instrId] = ApplyPrefixSizes32(result, prefix_info);
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { static_cast<uint8_t>(prefix_info.length + length), instrId };
     }
 
@@ -707,11 +767,19 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
         const auto modrm = buffer[prefix_info.length + 2];
         const auto mod   = static_cast<uint8_t>(modrm & 0b11'000'000u);
         const auto reg   = static_cast<uint8_t>((modrm & 0b00'111'000u) >> 3);
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
+        if (addr16 && buffer.size() < static_cast<size_t>(total_len)) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
 
         if (opcode2 == 0x0D) {
             if (const bool is_reg = (mod == 0b11'000'000u);
@@ -763,20 +831,37 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
         if (result.length >= 0xE0) {
             return result;
         }
-        // SIB base=5 post-correction: GetInstructionDescriptor_opcode_extension_0x0F_BA
-        // bakes kLengthTable_ModRM into the returned length, so we add +4 here.
-        if (ModrmHasSib(modrm)) {
-            if (buffer.size() <= static_cast<size_t>(prefix_info.length + 3)) {
-                return ERR_INSUFFICIENT_BUFFER;
+        if (addr16) {
+            // GetInstructionDescriptor_opcode_extension_0x0F_BA bakes
+            // kLengthTable_ModRM + the imm8 into the returned length; replace
+            // the ModR/M length component with the 16-bit-addressing length,
+            // preserving the counted immediate. rm=100 entries carry
+            // Sib_M* markers (no SIB byte exists) — resolve them synthetically.
+            result.length = static_cast<uint8_t>(
+                kLengthTable_ModRM_Addr16[modrm]
+                + (result.length - kLengthTable_ModRM[modrm]));
+            result.instrId = ResolveSibMarkers(result.instrId, 0);
+        } else {
+            // SIB base=5 post-correction: GetInstructionDescriptor_opcode_extension_0x0F_BA
+            // bakes kLengthTable_ModRM into the returned length, so we add +4 here.
+            if (ModrmHasSib(modrm)) {
+                if (buffer.size() <= static_cast<size_t>(prefix_info.length + 3)) {
+                    return ERR_INSUFFICIENT_BUFFER;
+                }
+                const auto sib = buffer[prefix_info.length + 3];
+                if ((modrm & 0b11'000'000u) == 0b00'000'000u
+                    && (sib & 0b000'000'111u) == 0b000'000'101u) {
+                    result.length = static_cast<uint8_t>(result.length + 4);
+                }
+                result.instrId = ResolveSibMarkers(result.instrId, sib);
             }
-            const auto sib = buffer[prefix_info.length + 3];
-            if ((modrm & 0b11'000'000u) == 0b00'000'000u
-                && (sib & 0b000'000'111u) == 0b000'000'101u) {
-                result.length = static_cast<uint8_t>(result.length + 4);
-            }
-            result.instrId = ResolveSibMarkers(result.instrId, sib);
         }
         result = ApplyPrefixSizes32(result, prefix_info);
+        // Addr16 truncation check: the trailing imm8 must be fully in-buffer
+        // (checked after ApplyPrefixSizes32 so a 66h shrink is reflected).
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + result.length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         result.length = static_cast<uint8_t>(prefix_info.length + result.length);
         return result;
     }
@@ -791,129 +876,40 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
             mod == 0b11'000'000u) {
             return ERR_UNDEFINED_INSTRUCTION;
         }
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         auto resolved_id = instr_id;
         // In x86-32 mode operands are always m32, r32.
         resolved_id.operands.operand[0] = Operand::m32;
         resolved_id.operands.operand[1] = Operand::r32;
         const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
+        if (addr16 && buffer.size() < static_cast<size_t>(total_len)) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { total_len, resolved_id };
     }
 
-    // Minimal SIMD P2.4: 0F 10/11 MOVUPS, 0F 28/29 MOVAPS, 0F 2E/2F UCOMISS/COMISS/UCOMISD/COMISD.
-    case 0x65: {
-        if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
-            return ERR_INSUFFICIENT_BUFFER;
-        }
-        if (prefix_info.has_prefix.has_rep != 0) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-        const bool has_66 = prefix_info.has_prefix.has_66 != 0;
-        const auto modrm  = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
-        }
-        const bool is_reg = (modrm & 0b11'000'000u) == 0b11'000'000u;
-        auto resolved_id  = instr_id;
+    // SIMD rows: descriptor-table dispatch (kSimdOpcodeTable + DecodeSimd2Byte).
+    // Same mandatory-prefix remap and rejections as the x64 path; no REX in
+    // 32-bit mode. A 67h prefix switches to 16-bit addressing (no SIB, disp16).
+    case 0x65:
+    case 0x66:
+        return DecodeSimd2Byte(prefix_info, buffer, opcode2, false,
+                               prefix_info.has_prefix.has_67 != 0);
 
-        switch (opcode2) {
-        case 0x10:
-            if (has_66) { return ERR_UNDEFINED_INSTRUCTION; }
-            resolved_id.operands.operand[0] = Operand::xmm;
-            resolved_id.operands.operand[1] = is_reg ? Operand::xmm : Operand::m128;
-            break;
-        case 0x11:
-            if (has_66) { return ERR_UNDEFINED_INSTRUCTION; }
-            resolved_id.operands.operand[0] = is_reg ? Operand::xmm : Operand::m128;
-            resolved_id.operands.operand[1] = Operand::xmm;
-            break;
-        case 0x28:
-            if (has_66) { return ERR_UNDEFINED_INSTRUCTION; }
-            resolved_id.operands.operand[0] = Operand::xmm;
-            resolved_id.operands.operand[1] = is_reg ? Operand::xmm : Operand::m128;
-            break;
-        case 0x29:
-            if (has_66) { return ERR_UNDEFINED_INSTRUCTION; }
-            resolved_id.operands.operand[0] = is_reg ? Operand::xmm : Operand::m128;
-            resolved_id.operands.operand[1] = Operand::xmm;
-            break;
-        case 0x2E:
-            resolved_id.operands.operand[0] = Operand::xmm;
-            resolved_id.operands.operand[1] = is_reg ? Operand::xmm : (has_66 ? Operand::m64 : Operand::m32);
-            if (has_66) { resolved_id.opcode = OpcodeId::UCOMISD; }
-            break;
-        case 0x2F:
-            resolved_id.operands.operand[0] = Operand::xmm;
-            resolved_id.operands.operand[1] = is_reg ? Operand::xmm : (has_66 ? Operand::m64 : Operand::m32);
-            if (has_66) { resolved_id.opcode = OpcodeId::COMISD; }
-            break;
-        default:
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-
-        resolved_id.operands.operand[2] = Operand::noopr;
-        resolved_id.operand_count       = 2;
-        const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
-        return { total_len, resolved_id };
-    }
-
-    // 0F 58/59/5C/5E SIMD arithmetic families with mandatory-prefix remap.
-    case 0x66: {
-        if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
-            return ERR_INSUFFICIENT_BUFFER;
-        }
-        const auto& [by_prefix] = kSimdArithmeticFamilyByOpcode2[opcode2];
-        if (by_prefix[0] == OpcodeId::INVALID_OPCODE) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-
-        const bool has_66  = prefix_info.has_prefix.has_66 != 0;
-        const bool has_rep = prefix_info.has_prefix.has_rep != 0;
-        const auto rep     = prefix_info.rep_byte;
-
-        if (has_66 && has_rep) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-
-        uint8_t variant_key = 0;
-        if (has_66) {
-            variant_key = 1;
-        } else if (has_rep) {
-            if (rep == static_cast<uint8_t>(Prefix32::REPE)) {
-                variant_key = 2;
-            } else if (rep == static_cast<uint8_t>(Prefix32::REPNE)) {
-                variant_key = 3;
-            } else {
-                return ERR_UNDEFINED_INSTRUCTION;
-            }
-        }
-
-        const auto [opcode_index, mem_operand] = kSimdPrefixVariants[variant_key];
-        const auto modrm  = buffer[prefix_info.length + 2];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_2byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
-        }
-
-        const bool is_reg = (modrm & 0b11'000'000u) == 0b11'000'000u;
-        auto resolved_id = instr_id;
-        resolved_id.opcode = by_prefix[opcode_index];
-        if (resolved_id.opcode == OpcodeId::INVALID_OPCODE) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-
-        resolved_id.operands.operand[0] = Operand::xmm;
-        resolved_id.operands.operand[1] = is_reg ? Operand::xmm : mem_operand;
-        resolved_id.operands.operand[2] = Operand::noopr;
-        resolved_id.operand_count       = 2;
-
-        const auto total_len = static_cast<uint8_t>(prefix_info.length + modrm_len + 1);
-        return { total_len, resolved_id };
-    }
+    // 0F 38/0F 3A: three-byte opcode space (SSSE3/SSE4.x/AES/PCLMUL/CRC32/
+    // MOVBE) dispatched through kDecodeTable_0F38/_0F3A + Dispatch3ByteOpcode;
+    // no REX in 32-bit mode, 67h switches to 16-bit addressing.
+    case 0x3E:
+        return Dispatch3ByteOpcode(prefix_info, buffer, opcode2, false,
+                                   prefix_info.has_prefix.has_67 != 0);
 
     case 0xD6:
         return ERR_UNDEFINED_INSTRUCTION;
@@ -961,15 +957,21 @@ auto X86Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> D
     }
 
     const auto opcode = buffer[prefix_info.length];
+    const bool addr16 = prefix_info.has_prefix.has_67 != 0;
     switch (const auto [tag, instr_id] = kDecodeTable_1byte_opcode_32[opcode]; tag.dispatch_code) {
     case 0x00: {
         if (buffer.size() <= static_cast<size_t>(prefix_info.length + 1)) {
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 1];
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_1byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_1byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         auto resolved_id = instr_id;
 
@@ -985,15 +987,23 @@ auto X86Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> D
             }
         }
 
-        // rm=100 (and mod!=11) → SIB byte follows; resolve stack markers (m* vs
-        // stack_m*) before size fixups. AdjustModrmLenForSib_1byte already
-        // verified the SIB byte is in-buffer.
-        if (ModrmHasSib(modrm)) {
+        // rm=100 (and mod!=11) → SIB byte follows (32-bit addressing); resolve
+        // stack markers (m* vs stack_m*) before size fixups.
+        // AdjustModrmLenForSib_1byte already verified the SIB byte is in-buffer.
+        // Under 67h there is no SIB byte: rm=100 form entries carry unresolved
+        // Sib_M* markers, resolved to the plain memory classes.
+        if (addr16) {
+            resolved_id = ResolveSibMarkers(resolved_id, 0);
+        } else if (ModrmHasSib(modrm)) {
             const auto sib = buffer[prefix_info.length + 2];
             resolved_id = ResolveSibMarkers(resolved_id, sib);
         }
 
         const auto [length, instrId] = ApplyPrefixSizes32({ modrm_len, resolved_id }, prefix_info);
+        // Addr16 truncation check: the 16-bit displacement must be in-buffer.
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { static_cast<uint8_t>(prefix_info.length + length), instrId };
     }
 
@@ -1024,9 +1034,20 @@ auto X86Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> D
         if (result.length >= 0xE0) {
             return result;
         }
-        // rm=100 (and mod!=11) → SIB byte follows; resolve stack markers. The
-        // mandatory disp32 (SIB.base=101) only applies at mod=00.
-        if (ModrmHasSib(modrm)) {
+        if (addr16) {
+            // The extension helpers (0x80…0xFF) bake kLengthTable_ModRM plus
+            // any immediates into the returned length; replace the ModR/M
+            // length component with the 16-bit-addressing length, preserving
+            // the counted immediates. rm=100 entries carry Sib_M* markers (no
+            // SIB byte exists) — resolve them synthetically, never reading a
+            // SIB byte.
+            result.length = static_cast<uint8_t>(
+                kLengthTable_ModRM_Addr16[modrm]
+                + (result.length - kLengthTable_ModRM[modrm]));
+            result.instrId = ResolveSibMarkers(result.instrId, 0);
+        } else if (ModrmHasSib(modrm)) {
+            // rm=100 (and mod!=11) → SIB byte follows; resolve stack markers.
+            // The mandatory disp32 (SIB.base=101) only applies at mod=00.
             if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
                 return ERR_INSUFFICIENT_BUFFER;
             }
@@ -1089,15 +1110,28 @@ auto X86Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> D
         if (form.operand[0] == Operand::invalid) {
             return ERR_UNDEFINED_INSTRUCTION;
         }
-        uint8_t modrm_len = kLengthTable_ModRM[modrm];
-        if (AdjustModrmLenForSib_1byte(prefix_info, buffer, modrm, modrm_len)) {
-            return ERR_INSUFFICIENT_BUFFER;
+        uint8_t modrm_len;
+        if (addr16) {
+            modrm_len = kLengthTable_ModRM_Addr16[modrm];
+        } else {
+            modrm_len = kLengthTable_ModRM[modrm];
+            if (AdjustModrmLenForSib_1byte(prefix_info, buffer, modrm, modrm_len)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
         }
         InstructionId resolved = { instr_id.opcode, 2, form };
-        if (ModrmHasSib(modrm)) {
+        if (addr16) {
+            // rm=100 form entries carry unresolved Sib_M* markers under 67h
+            // (no SIB byte exists); resolve them to the plain memory classes.
+            resolved = ResolveSibMarkers(resolved, 0);
+        } else if (ModrmHasSib(modrm)) {
             resolved = ResolveSibMarkers(resolved, buffer[prefix_info.length + 2]);
         }
         const auto [length, instrId] = ApplyPrefixSizes32({ modrm_len, resolved }, prefix_info);
+        // Addr16 truncation check: the 16-bit displacement must be in-buffer.
+        if (addr16 && buffer.size() < static_cast<size_t>(prefix_info.length) + length) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
         return { static_cast<uint8_t>(prefix_info.length + length), instrId };
     }
 
@@ -1106,12 +1140,15 @@ auto X86Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> D
             return ERR_INSUFFICIENT_BUFFER;
         }
         const auto modrm = buffer[prefix_info.length + 1];
-        auto result = GetInstructionDescriptor_x87(opcode, modrm, kLengthTable_ModRM[modrm]);
+        auto result = GetInstructionDescriptor_x87(
+            opcode, modrm, addr16 ? kLengthTable_ModRM_Addr16[modrm] : kLengthTable_ModRM[modrm]);
         if (result.length >= 0xE0) {
             return result;
         }
-        // SIB base=5 post-correction for x87 memory forms.
-        if ((modrm & 0b11'000'111u) == 0b00'000'100u) {
+        // SIB base=5 post-correction for x87 memory forms (32-bit addressing
+        // only; under 67h no SIB byte exists and the x87 memory table carries
+        // fixed operand classes, so nothing to resolve).
+        if (!addr16 && (modrm & 0b11'000'111u) == 0b00'000'100u) {
             if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
                 return ERR_INSUFFICIENT_BUFFER;
             }
