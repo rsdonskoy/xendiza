@@ -160,7 +160,9 @@ All decoders completed with `decoded=86009850`, `errors=0` on this corpus.
 
 ### x86-64 (64-bit path) specific
 
-- A focused `0x0F` two-byte subset is implemented: `Jcc rel32`, `CMOVcc`, `IMUL r,r/m`, `BSF`, `BSR`, `MOVZX`/`MOVSX` (`0F B6/B7/BE/BF`), `CMPXCHG` (`0F B0/B1`), `XADD` (`0F C0/C1`), `BT/BTS/BTR/BTC` (`0F A3/AB/B3/BB`), `BT/BTS/BTR/BTC` immediate group (`0F BA /4-/7`, `imm8`), `SETcc` (`0F 90-9F`), `BSWAP` (`0F C8-CF`), multibyte `NOP` (`0F 1F /0`), `SHLD`/`SHRD` (`0F A4/A5/AC/AD`), plus P2.4 SIMD forms: `MOVUPS` (`0F 10/11`), `MOVAPS` (`0F 28/29`), `UCOMISS/COMISS` (`0F 2E/2F`), `66`-prefixed `UCOMISD/COMISD`, and arithmetic families `0F 58/59/5C/5E` with prefix remap to `PS/PD/SS/SD`.
+- A focused `0x0F` two-byte subset is implemented: `Jcc rel32`, `CMOVcc`, `IMUL r,r/m`, `BSF`, `BSR`, `MOVZX`/`MOVSX` (`0F B6/B7/BE/BF`), `CMPXCHG` (`0F B0/B1`), `XADD` (`0F C0/C1`), `BT/BTS/BTR/BTC` (`0F A3/AB/B3/BB`), `BT/BTS/BTR/BTC` immediate group (`0F BA /4-/7`, `imm8`), `SETcc` (`0F 90-9F`), `BSWAP` (`0F C8-CF`), multibyte `NOP` (`0F 1F /0`), `SHLD`/`SHRD` (`0F A4/A5/AC/AD`).
+- Legacy-encoded SSE1/SSE2 is implemented as a shared descriptor table driven by a generic engine (both modes): packed moves (`MOVUPS`/`MOVAPS`/`MOVDQA`/`MOVDQU` `0F 10/11/28/29`, `66/F3 0F 6F/7F`), compares (`UCOMISS/COMISS/UCOMISD/COMISD`, `0F 2E/2F`), mandatory-prefix-remapped arithmetic/logical/CVT families (`0F 51/52/53/54-57/58/59/5A/5B/5C/5D/5E/5F`, `66/F2/F3 0F E6`, `66/F2 0F D0`, `66/F2 0F 7C/7D`), irregular moves and conversions (`0F 12/13/16/17`, `0F 50`, `F2/F3 0F 2A/2C/2D`, `66 0F 6E`, `66/F3 0F 7E`, `66 0F D6/D7/E7/F7`, `F3 0F 12/16`), trailing-immediate forms (`0F C2/C6`, `66/F3/F2 0F 70`, `66 0F C4/C5`, `66 0F 71/72/73` shift groups), and the `66`-mandatory packed-integer block as an explicit per-row enumeration (`0F 60-6D/6F`, `74-76`, `7F`, `D1-D5`, `D8-F6`, `F8-FE` minus dedicated rows). `REX.W` widens the marked GPR operands (`CVTSI2SS/SD`, `CVTT*2SI`, `MOVD`→`MOVQ`); invalid prefix combinations and MMX forms decode as `UNDEFINED_INSTRUCTION`.
+- **MMX strict rejection:** packed-integer opcodes without the mandatory `66h` and encodings with MMX (`mm`) register operands decode as `UNDEFINED_INSTRUCTION`; no `mm` operand types are reported.
 - System/privileged decode: Group 6 (`0F 00`: `SLDT`/`STR`/`LLDT`/`LTR`/`VERR`/`VERW`), Group 7 (`0F 01`: `SGDT`/`SIDT`/`LGDT`/`LIDT`/`SMSW`/`LMSW`/`INVLPG` plus register forms `SWAPGS`/`RDTSCP`/`MONITOR`/`MWAIT`/`CLAC`/`STAC`/`XGETBV`/`XSETBV`/`XTEST`/`RDPKRU`/`WRPKRU`/`SERIALIZE`), Group 16 (`0F 18`: `PREFETCHNTA/T0/T1/T2`), `CLDEMOTE` (`0F 1C`), `ENDBR64`/`ENDBR32` (`F3 0F 1E FA/FB`), `MOV` to/from control and debug registers (`0F 20-23`), Group 9 (`0F C7`: `CMPXCHG8B`, `CMPXCHG16B`, `RDRAND`, `RDSEED`, `XRSTORS`/`XSAVEC`/`XSAVES`, `RDPID`), and `0F AE` (`FXSAVE`/`FXRSTOR`/`LDMXCSR`/`STMXCSR`/`LFENCE`/`MFENCE`/`SFENCE`/`CLFLUSH`).
 - x87 core one-byte family (`D8`-`DF`) is implemented with abstract operand forms, including stack forms (`st0`/`sti`), floating memory forms (`m32fp`/`m64fp`/`m80fp`), environment/control forms (`FLDENV`/`FNSTENV`/`FSAVE`/`FRSTOR`), BCD forms (`FBLD`/`FBSTP`), and strict `FWAIT` vs `FN*` distinction.
 
@@ -169,10 +171,10 @@ All decoders completed with `decoded=86009850`, `errors=0` on this corpus.
 - Same 1-byte opcode map coverage as the x64 path, adapted for 32-bit default operand sizes (no `REX` prefix, `0x66` toggles 32↔16 instead of 64↔16).
 - Segment override prefix parsing (`CS`/`SS`/`DS`/`ES`/`FS`/`GS`) with composite memory operand reporting (for example `ds_moffs32`, `fs_m32`).
 - Opcode-embedded `INC`/`DEC` (`0x40–0x4F`) decoded as `INC`/`DEC` `r32`/`r16` (rather than REX prefix bytes).
-- `0x0F` two-byte subset mirrors the x64 coverage for the `MOVZX`/`MOVSX`, bit-test, `SETcc`, `BSWAP`, `SHLD`/`SHRD`, SIMD, and `0F AE` fence/flush families; integer width is 32-bit by default.
+- `0x0F` two-byte subset mirrors the x64 coverage for the `MOVZX`/`MOVSX`, bit-test, `SETcc`, `BSWAP`, `SHLD`/`SHRD`, legacy SSE1/SSE2, and `0F AE` fence/flush families; integer width is 32-bit by default (GPR-bearing SIMD forms report `r32`/`m32`).
 - Group 6 (`0F 00`), Group 7 (`0F 01`), Group 16 (`0F 18`), `PREFETCH` (`0F 18`), `0F BA` bit ops, `MOVNTI` (`0F C3`), and Group 9 (`0F C7`) are implemented for x86-32 (no `CMPXCHG16B`; GPR size is `r32` instead of `r64`).
 - `F3`-prefixed register forms of `0F AE` (`RDFSBASE`/`RDGSBASE`/`WRFSBASE`/`WRGSBASE`) are x64-only and return `UNDEFINED_INSTRUCTION` in x86-32 mode.
-- VEX/EVEX and broader AVX/SSE opcode families remain out of current scope.
+- VEX/EVEX, AVX, and three-byte-opcode ISA extensions (`0F 38`/`0F 3A`: SSSE3/SSE4.x incl. `CRC32`) remain out of current scope.
 
 ## Authorship
 

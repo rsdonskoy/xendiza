@@ -45,20 +45,32 @@ cmd //c test/diff/build.bat         # build out/harness.exe (MSVC dev environmen
 python test/diff/compare.py         # run and report
 ```
 
-## Current results (2026-10-28, post fix-operand16-branches-and-aam-aad + legacy-prefix fixes)
+## Current results (2026-11-04, post add-sse1-sse2-support)
 
 - 425 streams / 773 expected instructions from 13 files.
-- Agreement: 89.9% of comparable instructions; Zydis vectors 53/56.
+- Agreement: **90.7%** of comparable instructions (baseline before the SSE
+  change: 89.9%); Zydis vectors 53/56. Delta drivers: the legacy SSE1/SSE2
+  scope gaps closed (`MOVSD F2 0F 10`, `MOVQ 66 0F D6`, `PMOVMSKB`, packed
+  block rows), plus harness mnemonic-name completion.
 - Remaining deltas classify into:
   - **By design** (unit-tested in `test/`): legacy-invalid opcodes in 32-bit
     mode (POP/PUSH segreg, PUSHA/POPA, INTO), MOV CR/DR memory forms,
-    strict duplicate/mandatory-prefix rejection, F3-repurposed LZCNT/TZCNT/
-    POPCNT decoded as BSF/BSR, string instructions without explicit operands,
+    strict duplicate/mandatory-prefix rejection (capstone's
+    `x86-mandatory-prefixes.yaml` expects last-prefix-wins for `66`+`F2`/`F3`
+    mixes; xendiza returns undefined-instruction), MMX strict rejection
+    (packed-integer opcodes without the mandatory `66h` and MMX-operand
+    variants such as `F2/F3 0F D6` and REX+MMX `0F 6E/7E` decode
+    `UNDEFINED_INSTRUCTION`), F2-prefixed `0F BC/BD` decoded as BSF/BSR
+    (Intel ignores `F2` there; capstone expects `LZCNT`/`TZCNT` — xendiza
+    follows the SDM), capstone aliasing `66 0F D6` to `MOV` (xendiza reports
+    the SDM mnemonic `MOVQ`), string instructions without explicit operands,
     and 64-bit near branches keeping `rel32` under the `0x66` prefix (Intel
     ignores the prefix there; see below).
-  - **Scope gaps**: MMX (`0F 6E/7E`), SSE beyond the P2.4 subset
-    (`MOVSD F2 0F 10`, `MOVQ 66 0F D6`, `PMOVMSKB`, `CRC32`, SSSE3), AVX files
-    excluded entirely.
+  - **Scope gaps**: three-byte opcodes `0F 38`/`0F 3A` (`CRC32`,
+    `PHADDSW`, SSSE3/SSE4.x), reserved-NOP forms `0F 19-1B/1D` (capstone
+    reports `NOP`), VEX/EVEX (zydis EVEX fuzzer case), and the capstone
+    `48 A1` stream quirk (expects `imm64` operand naming for `moffs64`).
+    AVX files are excluded entirely.
   - **Known upstream divergence**: capstone's `x86_jcc_mode.yaml` "DEFAULT"
     64-bit vectors expect `0x66`-prefixed Jcc to decode as `rel16`
     (AMD-style). xendiza follows the Intel SDM / Zydis default, where the
