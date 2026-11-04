@@ -376,6 +376,32 @@ static constexpr std::array<uint8_t, 256> kLengthTable_ModRM = { {
 /*F0*/ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2
 } };
 
+// 16-bit-addressing ModR/M length table (32-bit mode under a 67h prefix).
+// Same "opcode + ModR/M + displacement" convention as kLengthTable_ModRM, but
+// with 16-bit addressing rules: mod=00 carries no displacement except rm=110
+// (disp16 → 4); mod=01 carries disp8 (3); mod=10 carries disp16 (4); mod=11
+// has no displacement (2). rm=100 is plain memory under 16-bit addressing —
+// no SIB byte exists, so no +SIB term appears anywhere in the table.
+static constexpr std::array<uint8_t, 256> kLengthTable_ModRM_Addr16 = { {
+/*     0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F */
+/*00*/ 2, 2, 2, 2, 2, 2, 4, 2, 2, 2, 2, 2, 2, 2, 4, 2,
+/*10*/ 2, 2, 2, 2, 2, 2, 4, 2, 2, 2, 2, 2, 2, 2, 4, 2,
+/*20*/ 2, 2, 2, 2, 2, 2, 4, 2, 2, 2, 2, 2, 2, 2, 4, 2,
+/*30*/ 2, 2, 2, 2, 2, 2, 4, 2, 2, 2, 2, 2, 2, 2, 4, 2,
+/*40*/ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+/*50*/ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+/*60*/ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+/*70*/ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+/*80*/ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+/*90*/ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+/*A0*/ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+/*B0*/ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+/*C0*/ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+/*D0*/ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+/*E0*/ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+/*F0*/ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2
+} };
+
 // Maps (segment_register, memory_operand) to the composite segment-prefixed memory operand.
 // Returns the original memory operand unchanged if no composite mapping exists.
 constexpr auto MakeCompositeMemOperand(const Operand seg, const Operand mem) noexcept -> Operand
@@ -1947,15 +1973,7 @@ constexpr auto DecodeSimd2Byte(const PrefixInfoT& prefix_info, const gsl::span<c
     if (addr16) {
         // 16-bit addressing: rm=100 is [SI], not a SIB escape; mod=00/rm=110
         // and mod=10 carry disp16; mod=01 carries disp8.
-        const uint8_t mod = static_cast<uint8_t>(modrm >> 6);
-        const uint8_t rm  = static_cast<uint8_t>(modrm & 7u);
-        // kLengthTable_ModRM convention: opcode + ModR/M + displacement (+SIB).
-        modrm_len = 2;
-        if (mod == 1) {
-            modrm_len = 3; // + disp8
-        } else if (mod == 2 || (mod == 0 && rm == 6)) {
-            modrm_len = 4; // + disp16
-        }
+        modrm_len = kLengthTable_ModRM_Addr16[modrm];
     } else {
         modrm_len = kLengthTable_ModRM[modrm];
 
