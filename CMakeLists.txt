@@ -45,6 +45,10 @@ add_executable(xendiza_tests
     test/test_x86_x87_opcodes.cpp
     test/test_x86_prefixes.cpp
     test/test_x64_prefixes.cpp
+    test/test_sse_m1.cpp
+    test/test_sse_m2.cpp
+    test/test_sse_m3.cpp
+    test/test_sse_m4.cpp
     test/test_perf_regression.cpp
 )
 

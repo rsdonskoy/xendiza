@@ -239,11 +239,14 @@ TEST(TwoByteOpcodeTest, COMISS_0F2F_modrm_mem)
     EXPECT_EQ(result.length, 3);
 }
 
-TEST(TwoByteOpcodeTest, SIMD_0F10_66_prefix_is_invalid)
+TEST(TwoByteOpcodeTest, SIMD_0F10_66_prefix_MOVUPD)
 {
+    // Full SSE1/SSE2 scope: 66 0F 10 is MOVUPD (no longer the P2.4 rejection).
     auto result = Disasm(std::array<uint8_t, 4>{0x66, 0x0F, 0x10, 0xC1});
-    EXPECT_EQ(result.instrId.opcode, OpcodeId::INVALID_OPCODE);
-    EXPECT_EQ(result.length, static_cast<uint8_t>(ErrorCode::UNDEFINED_INSTRUCTION));
+    EXPECT_EQ(result.instrId.opcode, OpcodeId::MOVUPD);
+    EXPECT_EQ(result.instrId.operands.operand[0], Operand::xmm);
+    EXPECT_EQ(result.instrId.operands.operand[1], Operand::xmm);
+    EXPECT_EQ(result.length, 4);
 }
 
 TEST(TwoByteOpcodeTest, SIMD_0F2E_F3_prefix_is_invalid)
@@ -307,11 +310,57 @@ TEST(TwoByteOpcodeTest, COMISD_660F2F_modrm_mem)
     EXPECT_EQ(result.length, 4);
 }
 
-TEST(TwoByteOpcodeTest, SIMD_0F11_66_prefix_is_invalid)
+TEST(TwoByteOpcodeTest, SIMD_0F11_66_prefix_MOVUPD_store)
 {
+    // Full SSE1/SSE2 scope: 66 0F 11 is the MOVUPD store (P2.4 rejected it).
     auto result = Disasm(std::array<uint8_t, 4>{0x66, 0x0F, 0x11, 0xC1});
-    EXPECT_EQ(result.instrId.opcode, OpcodeId::INVALID_OPCODE);
-    EXPECT_EQ(result.length, static_cast<uint8_t>(ErrorCode::UNDEFINED_INSTRUCTION));
+    EXPECT_EQ(result.instrId.opcode, OpcodeId::MOVUPD);
+    EXPECT_EQ(result.instrId.operands.operand[0], Operand::xmm);
+    EXPECT_EQ(result.instrId.operands.operand[1], Operand::xmm);
+    EXPECT_EQ(result.length, 4);
+}
+
+TEST(TwoByteOpcodeTest, SIMD_0F10_11_scalar_and_packed_variants)
+{
+    // F2 0F 10 /r -> MOVSD xmm, m64 (the largest single diff-harness gap).
+    {
+        auto result = Disasm(std::array<uint8_t, 9>{0xF2, 0x0F, 0x10, 0x2C, 0x25, 0xF8, 0xFF, 0xFF, 0xFF});
+        EXPECT_EQ(result.instrId.opcode, OpcodeId::MOVSD);
+        EXPECT_EQ(result.instrId.operands.operand[0], Operand::xmm);
+        EXPECT_EQ(result.instrId.operands.operand[1], Operand::m64);
+        EXPECT_EQ(result.length, 9);
+    }
+    // F3 0F 10 /r -> MOVSS xmm, m32.
+    {
+        auto result = Disasm(std::array<uint8_t, 4>{0xF3, 0x0F, 0x10, 0x01});
+        EXPECT_EQ(result.instrId.opcode, OpcodeId::MOVSS);
+        EXPECT_EQ(result.instrId.operands.operand[1], Operand::m32);
+        EXPECT_EQ(result.length, 4);
+    }
+    // F2 0F 11 /r (mem) -> MOVSD m64, xmm (store direction).
+    {
+        auto result = Disasm(std::array<uint8_t, 4>{0xF2, 0x0F, 0x11, 0x01});
+        EXPECT_EQ(result.instrId.opcode, OpcodeId::MOVSD);
+        EXPECT_EQ(result.instrId.operands.operand[0], Operand::m64);
+        EXPECT_EQ(result.instrId.operands.operand[1], Operand::xmm);
+        EXPECT_EQ(result.length, 4);
+    }
+    // 66 0F 29 (mem) -> MOVAPD m128, xmm; 66 0F 28 -> MOVAPD xmm, m128.
+    {
+        auto result = Disasm(std::array<uint8_t, 4>{0x66, 0x0F, 0x28, 0x01});
+        EXPECT_EQ(result.instrId.opcode, OpcodeId::MOVAPD);
+        EXPECT_EQ(result.instrId.operands.operand[1], Operand::m128);
+    }
+    {
+        auto result = Disasm(std::array<uint8_t, 4>{0x66, 0x0F, 0x29, 0x01});
+        EXPECT_EQ(result.instrId.opcode, OpcodeId::MOVAPD);
+        EXPECT_EQ(result.instrId.operands.operand[0], Operand::m128);
+    }
+    // F2/F3 on 0F 28 are absent variants (aligned moves have no scalar form).
+    {
+        auto result = Disasm(std::array<uint8_t, 4>{0xF2, 0x0F, 0x28, 0xC1});
+        EXPECT_EQ(result.length, static_cast<uint8_t>(ErrorCode::UNDEFINED_INSTRUCTION));
+    }
 }
 
 TEST(TwoByteOpcodeTest, ADDPS_0F58_modrm_reg)
