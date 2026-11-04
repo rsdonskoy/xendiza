@@ -904,6 +904,13 @@ auto X86Traits::Decode2ByteOpcode(const PrefixInfo32& prefix_info, gsl::span<con
         return DecodeSimd2Byte(prefix_info, buffer, opcode2, false,
                                prefix_info.has_prefix.has_67 != 0);
 
+    // 0F 38/0F 3A: three-byte opcode space (SSSE3/SSE4.x/AES/PCLMUL/CRC32/
+    // MOVBE) dispatched through kDecodeTable_0F38/_0F3A + Dispatch3ByteOpcode;
+    // no REX in 32-bit mode, 67h switches to 16-bit addressing.
+    case 0x3E:
+        return Dispatch3ByteOpcode(prefix_info, buffer, opcode2, false,
+                                   prefix_info.has_prefix.has_67 != 0);
+
     case 0xD6:
         return ERR_UNDEFINED_INSTRUCTION;
 

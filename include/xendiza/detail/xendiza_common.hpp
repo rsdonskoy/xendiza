@@ -1427,6 +1427,20 @@ enum class SimdImmKind : uint8_t {
     imm8  // one trailing imm8 byte counted in the length
 };
 
+// Prefix-slot resolution policy (add-0f38-0f3a-support design Decision 3).
+//   Default: mandatory-prefix slot table via SelectSimdSlot — none/66h/F3/F2
+//     select slots 0-3; 66h together with F2/F3 is UNDEFINED; 66h never
+//     shrinks (it is a mandatory prefix, not an operand-size override).
+//   SizeOverride: shared MOVBE/CRC32 rows — no REP prefix selects the none
+//     slot (MOVBE), F2 selects the F2 slot (CRC32), F3 is UNDEFINED; 66h
+//     never selects a slot, it is an operand-size override applied through
+//     the selected slot's shrink_66 masks when REX.W is clear, and is legal
+//     together with F2 (CRC32 r/m16).
+enum class SimdPrefixPolicy : uint8_t {
+    Default,
+    SizeOverride
+};
+
 struct SimdSlot {
     OpcodeId opcode_reg;  // mod=11 mnemonic; INVALID_OPCODE = form illegal
     OpcodeId opcode_mem;  // mod!=11 mnemonic; INVALID_OPCODE = form illegal
@@ -1436,6 +1450,9 @@ struct SimdSlot {
     uint8_t rex_w_reg = 0; // bitmask: operand positions widened by REX.W (reg form)
     uint8_t rex_w_mem = 0; // bitmask: operand positions widened by REX.W (mem form)
     Operands pair_mem;    // full operand pair, mod!=11
+    uint8_t shrink_66 = 0; // bitmask: operand positions shrunk r32→r16 / m32→m16
+                           // under a 66h operand-size override (size-override rows
+                           // only; REX.W clear — REX.W takes precedence)
 };
 
 // Operand pair for illegal forms (reg-only / mem-only slot halves).
@@ -1452,6 +1469,7 @@ struct SimdRow {
         return s;
     }();
     SimdImmKind imm_kind = SimdImmKind::none;
+    SimdPrefixPolicy prefix_policy = SimdPrefixPolicy::Default;
     // Optional 8-entry reg-field sub-table (66 0F 71/72/73 shift groups): the
     // reg field selects the slot for mod=11 forms; memory forms fall through
     // to the row slots, which stay INVALID for these rows (reg-only).
@@ -1543,6 +1561,18 @@ constexpr auto SimdWidenOperandRexW(const Operand op) noexcept -> Operand
     case Operand::m32:       return Operand::m64;
     case Operand::stack_m32: return Operand::stack_m64;
     default:                 return op;
+    }
+}
+
+// Shrinks a marked operand under a 66h operand-size override (size-override
+// rows only: MOVBE/CRC32, where 66h is not a mandatory prefix). Applies only
+// when REX.W is clear — REX.W takes precedence and widens instead.
+constexpr auto SimdShrinkOperand66(const Operand op) noexcept -> Operand
+{
+    switch (op) {
+    case Operand::r32: return Operand::r16;
+    case Operand::m32: return Operand::m16;
+    default:           return op;
     }
 }
 
@@ -1872,8 +1902,13 @@ inline constexpr auto kSimdOpcodeTable = [] {
 //   3. any INVALID mnemonic or operand in the selected slot → UNDEFINED.
 // `modrm_len` comes from the caller (kLengthTable_ModRM + SIB base=5 fix);
 // the returned length is relative to the start of the 0F byte.
+// `apply_66_shrink` is set by size-override rows (MOVBE/CRC32) when a 66h
+// operand-size override is present; the shrink then applies through the
+// selected slot's shrink_66 mask, but only when REX.W is clear (REX.W takes
+// precedence and widens instead).
 constexpr auto DecodeSimdRow(const SimdRow& row, const uint8_t slot_index, const bool rex_w,
-                             const uint8_t modrm, const uint8_t modrm_len) noexcept
+                             const uint8_t modrm, const uint8_t modrm_len,
+                             const bool apply_66_shrink = false) noexcept
     -> DecodedInstruction
 {
     const bool is_reg = (modrm & 0b11'000'000u) == 0b11'000'000u;
@@ -1900,6 +1935,13 @@ constexpr auto DecodeSimdRow(const SimdRow& row, const uint8_t slot_index, const
         for (uint8_t i = 0; i < pair.operand.size(); ++i) {
             if (widen_mask & (1u << i)) {
                 pair.operand[i] = SimdWidenOperandRexW(pair.operand[i]);
+            }
+        }
+    } else if (apply_66_shrink) {
+        const auto shrink_mask = slot.shrink_66;
+        for (uint8_t i = 0; i < pair.operand.size(); ++i) {
+            if (shrink_mask & (1u << i)) {
+                pair.operand[i] = SimdShrinkOperand66(pair.operand[i]);
             }
         }
     }
@@ -2005,6 +2047,305 @@ constexpr auto DecodeSimd2Byte(const PrefixInfoT& prefix_info, const gsl::span<c
     return { static_cast<uint8_t>(prefix_info.length + length), instrId };
 }
 
+// ── Three-byte opcode tables (0F 38 / 0F 3A), keyed by the third byte ────
+// Same SimdRow schema as kSimdOpcodeTable; add-0f38-0f3a-support Decision 1.
+// Rows are filled by explicit SDM-derived enumeration (M4 Decision 11
+// process: local dump .ref/sdm-md/ cross-checked against the bundled
+// Zydis/Capstone vectors, never from memory); unlisted rows stay INVALID in
+// every slot and decode as undefined-instruction.
+//
+// Schema outcomes recorded per the change design (Decisions 2/3):
+//   - Row prefix policy: 66-mandatory SIMD rows use SimdPrefixPolicy::Default
+//     (SelectSimdSlot). The shared MOVBE/CRC32 rows (38 F0/F1) use
+//     SimdPrefixPolicy::SizeOverride — MOVBE in the none slot, CRC32 in the
+//     F2 slot, F3 undefined, and 66h acting as an operand-size override via
+//     the per-slot shrink_66 masks (MOVBE: both operands; CRC32 F1: source
+//     only; CRC32 F0: neither), with REX.W precedence through rex_w_* masks.
+//   - Memory-mandatory rows (MOVBE load/store, MOVNTDQA) set opcode_reg =
+//     INVALID_OPCODE, so mod=11 resolves UNDEFINED through the existing rule.
+//   - PEXTR*/PINSR* 64-bit forms use opcode_reg_w/opcode_mem_w mnemonic
+//     overrides plus rex_w_* widening masks.
+//   - Implied-register policy: the architectural implied operands of
+//     PCMPESTR*/PCMPISTR* (EAX/EDX(/ECX)) and the BLENDV* XMM0 mask are NOT
+//     reported — rows carry their two explicit operands (+imm8) only.
+//   - LOCK (F0h) is #UD on every 0F 38/0F 3A row per the SDM exception
+//     tables; Dispatch3ByteOpcode rejects it at the shared entry.
+inline constexpr auto kDecodeTable_0F38 = [] {
+    std::array<SimdRow, 256> table{};
+
+    // ── M5b: 0F 38 rows (SDM enumeration in the change design checklist;
+    // all rows Valid in 64-bit AND compat/leg mode) ─────────────────────────
+    // SSSE3 packed-integer block: 66-mandatory uniform xmm, xmm/m128 rows
+    // (the no-66 forms are MMX and stay rejected).
+    table[0x00] = SimdPackedRow(OpcodeId::PSHUFB);
+    table[0x01] = SimdPackedRow(OpcodeId::PHADDW);
+    table[0x02] = SimdPackedRow(OpcodeId::PHADDD);
+    table[0x03] = SimdPackedRow(OpcodeId::PHADDSW);
+    table[0x04] = SimdPackedRow(OpcodeId::PMADDUBSW);
+    table[0x05] = SimdPackedRow(OpcodeId::PHSUBW);
+    table[0x06] = SimdPackedRow(OpcodeId::PHSUBD);
+    table[0x07] = SimdPackedRow(OpcodeId::PHSUBSW);
+    table[0x08] = SimdPackedRow(OpcodeId::PSIGNB);
+    table[0x09] = SimdPackedRow(OpcodeId::PSIGNW);
+    table[0x0A] = SimdPackedRow(OpcodeId::PSIGND);
+    table[0x0B] = SimdPackedRow(OpcodeId::PMULHRSW);
+    table[0x1C] = SimdPackedRow(OpcodeId::PABSB);
+    table[0x1D] = SimdPackedRow(OpcodeId::PABSW);
+    table[0x1E] = SimdPackedRow(OpcodeId::PABSD);
+
+    // SSE4.1 blend-with-implied-mask + PTEST rows: 66-only; the architectural
+    // XMM0 mask of 10/14/15 is NOT part of the reported operand contract.
+    table[0x10] = SimdPackedRow(OpcodeId::PBLENDVB);
+    table[0x14] = SimdPackedRow(OpcodeId::BLENDVPS);
+    table[0x15] = SimdPackedRow(OpcodeId::BLENDVPD);
+    table[0x17] = SimdPackedRow(OpcodeId::PTEST);
+
+    // SSE4.1 sign/zero-extension loads: 66-only; the memory class narrows per
+    // row (PMOVSX/PMOVZX pages: *BW/*WD/*DQ m64, *BD/*WQ m32, *BQ m16).
+    table[0x20] = SimdSingleSlotRow(1, OpcodeId::PMOVSX, OPRS2(xmm, xmm), OpcodeId::PMOVSX, OPRS2(xmm, m64));
+    table[0x21] = SimdSingleSlotRow(1, OpcodeId::PMOVSX, OPRS2(xmm, xmm), OpcodeId::PMOVSX, OPRS2(xmm, m32));
+    table[0x22] = SimdSingleSlotRow(1, OpcodeId::PMOVSX, OPRS2(xmm, xmm), OpcodeId::PMOVSX, OPRS2(xmm, m16));
+    table[0x23] = SimdSingleSlotRow(1, OpcodeId::PMOVSX, OPRS2(xmm, xmm), OpcodeId::PMOVSX, OPRS2(xmm, m64));
+    table[0x24] = SimdSingleSlotRow(1, OpcodeId::PMOVSX, OPRS2(xmm, xmm), OpcodeId::PMOVSX, OPRS2(xmm, m32));
+    table[0x25] = SimdSingleSlotRow(1, OpcodeId::PMOVSX, OPRS2(xmm, xmm), OpcodeId::PMOVSX, OPRS2(xmm, m64));
+    table[0x30] = SimdSingleSlotRow(1, OpcodeId::PMOVZX, OPRS2(xmm, xmm), OpcodeId::PMOVZX, OPRS2(xmm, m64));
+    table[0x31] = SimdSingleSlotRow(1, OpcodeId::PMOVZX, OPRS2(xmm, xmm), OpcodeId::PMOVZX, OPRS2(xmm, m32));
+    table[0x32] = SimdSingleSlotRow(1, OpcodeId::PMOVZX, OPRS2(xmm, xmm), OpcodeId::PMOVZX, OPRS2(xmm, m16));
+    table[0x33] = SimdSingleSlotRow(1, OpcodeId::PMOVZX, OPRS2(xmm, xmm), OpcodeId::PMOVZX, OPRS2(xmm, m64));
+    table[0x34] = SimdSingleSlotRow(1, OpcodeId::PMOVZX, OPRS2(xmm, xmm), OpcodeId::PMOVZX, OPRS2(xmm, m32));
+    table[0x35] = SimdSingleSlotRow(1, OpcodeId::PMOVZX, OPRS2(xmm, xmm), OpcodeId::PMOVZX, OPRS2(xmm, m64));
+
+    // Uniform 66-mandatory packed rows.
+    table[0x28] = SimdPackedRow(OpcodeId::PMULDQ);
+    table[0x29] = SimdPackedRow(OpcodeId::PCMPEQQ);
+    table[0x2B] = SimdPackedRow(OpcodeId::PACKUSDW);
+    table[0x37] = SimdPackedRow(OpcodeId::PCMPGTQ); // SSE4.2
+    table[0x40] = SimdPackedRow(OpcodeId::PMULLD);
+    table[0x41] = SimdPackedRow(OpcodeId::PHMINPOSUW);
+
+    // 66 0F 38 2A MOVNTDQA xmm1, m128: memory-source-only — the register form
+    // is reserved (#UD); opcode_reg = INVALID resolves mod=11 UNDEFINED.
+    table[0x2A] = SimdSingleSlotRow(1, OpcodeId::INVALID_OPCODE, kSimdNoOperands,
+                                    OpcodeId::MOVNTDQA, OPRS2(xmm, m128));
+
+    // AES-NI round/inverse rows: 66-only xmm, xmm/m128.
+    table[0xDB] = SimdPackedRow(OpcodeId::AESIMC);
+    table[0xDC] = SimdPackedRow(OpcodeId::AESENC);
+    table[0xDD] = SimdPackedRow(OpcodeId::AESENCLAST);
+    table[0xDE] = SimdPackedRow(OpcodeId::AESDEC);
+    table[0xDF] = SimdPackedRow(OpcodeId::AESDECLAST);
+
+    // Shared MOVBE/CRC32 rows (38 F0 load / 38 F1 store), SizeOverride policy
+    // (design Decision 3): no REP → MOVBE slot, F2 → CRC32 slot, F3 →
+    // UNDEFINED. 66h never selects a slot: with REX.W clear it shrinks
+    // through shrink_66 (MOVBE both operands; CRC32 F1 source only; CRC32 F0
+    // none), with REX.W set it loses precedence and rex_w_* widens instead.
+    // Both MOVBE directions are memory-only (opcode_reg = INVALID; Valid in
+    // both modes); CRC32 is register+memory legal, Valid in both modes.
+    {
+        auto& row = table[0xF0];
+        row.prefix_policy = SimdPrefixPolicy::SizeOverride;
+        {
+            auto& movbe = row.slots[0]; // NFx 0F 38 F0: MOVBE r32, m32 (load)
+            movbe.opcode_reg = OpcodeId::INVALID_OPCODE;
+            movbe.pair_reg   = kSimdNoOperands;
+            movbe.opcode_mem = OpcodeId::MOVBE;
+            movbe.pair_mem   = OPRS2(r32, m32);
+            movbe.shrink_66  = 0b11; // 66h: r16, m16
+            movbe.rex_w_mem  = 0b11; // REX.W: r64, m64
+        }
+        {
+            auto& crc = row.slots[3]; // F2 0F 38 F0: CRC32 r32, r/m8
+            crc.opcode_reg = OpcodeId::CRC32;
+            crc.pair_reg   = OPRS2(r32, r8);
+            crc.opcode_mem = OpcodeId::CRC32;
+            crc.pair_mem   = OPRS2(r32, m8);
+            crc.shrink_66  = 0b00; // 66h: r32, r/m8 unchanged
+            crc.rex_w_reg  = 0b01; // REX.W: r64, r8 (destination only)
+            crc.rex_w_mem  = 0b01; // REX.W: r64, m8
+        }
+    }
+    {
+        auto& row = table[0xF1];
+        row.prefix_policy = SimdPrefixPolicy::SizeOverride;
+        {
+            auto& movbe = row.slots[0]; // NFx 0F 38 F1: MOVBE m32, r32 (store)
+            movbe.opcode_reg = OpcodeId::INVALID_OPCODE;
+            movbe.pair_reg   = kSimdNoOperands;
+            movbe.opcode_mem = OpcodeId::MOVBE;
+            movbe.pair_mem   = OPRS2(m32, r32);
+            movbe.shrink_66  = 0b11; // 66h: m16, r16
+            movbe.rex_w_mem  = 0b11; // REX.W: m64, r64
+        }
+        {
+            auto& crc = row.slots[3]; // F2 0F 38 F1: CRC32 r32, r/m32
+            crc.opcode_reg = OpcodeId::CRC32;
+            crc.pair_reg   = OPRS2(r32, r32);
+            crc.opcode_mem = OpcodeId::CRC32;
+            crc.pair_mem   = OPRS2(r32, m32);
+            crc.shrink_66  = 0b10; // 66h: source shrinks to r16/m16
+            crc.rex_w_reg  = 0b11; // REX.W: r64, r64
+            crc.rex_w_mem  = 0b11; // REX.W: r64, m64
+        }
+    }
+
+    // Not enumerated (stay INVALID in every slot): 0F 38 F6/F7 ADCX/ADOX
+    // (design Non-Goal), the SHA rows (38 C8-CD, 3A CC belongs to the 3A
+    // space's SHA1RNDS4 anyway), and every reserved third byte.
+    return table;
+}();
+
+inline constexpr auto kDecodeTable_0F3A = [] {
+    std::array<SimdRow, 256> table{};
+
+    // ── M5a: 0F 3A rows (SDM enumeration in the change design checklist;
+    // all rows 66-mandatory with trailing imm8, Valid in both modes) ────────
+    // ROUND family: none/F2/F3 absent; memory classes m128/m128/m32/m64.
+    table[0x08] = SimdSingleSlotRow(1, OpcodeId::ROUNDPS, OPRS2(xmm, xmm), OpcodeId::ROUNDPS, OPRS2(xmm, m128));
+    table[0x09] = SimdSingleSlotRow(1, OpcodeId::ROUNDPD, OPRS2(xmm, xmm), OpcodeId::ROUNDPD, OPRS2(xmm, m128));
+    table[0x0A] = SimdSingleSlotRow(1, OpcodeId::ROUNDSS, OPRS2(xmm, xmm), OpcodeId::ROUNDSS, OPRS2(xmm, m32));
+    table[0x0B] = SimdSingleSlotRow(1, OpcodeId::ROUNDSD, OPRS2(xmm, xmm), OpcodeId::ROUNDSD, OPRS2(xmm, m64));
+    // BLEND/PALIGNR: uniform xmm, xmm/m128 + imm8.
+    table[0x0C] = SimdPackedRow(OpcodeId::BLENDPS);
+    table[0x0D] = SimdPackedRow(OpcodeId::BLENDPD);
+    table[0x0E] = SimdPackedRow(OpcodeId::PBLENDW);
+    table[0x0F] = SimdPackedRow(OpcodeId::PALIGNR);
+    // Extract family: destination selected by the ModR/M; trailing imm8.
+    // PEXTRD/PINSRD gain REX.W mnemonic overrides (PEXTRQ/PINSRQ) plus
+    // widening masks; those forms are 64-bit-only (no REX in 32-bit mode).
+    table[0x14] = SimdSingleSlotRow(1, OpcodeId::PEXTRB, OPRS2(r32, xmm), OpcodeId::PEXTRB, OPRS2(m8, xmm));
+    table[0x15] = SimdSingleSlotRow(1, OpcodeId::PEXTRW, OPRS2(r32, xmm), OpcodeId::PEXTRW, OPRS2(m16, xmm));
+    table[0x16] = SimdSingleSlotRow(1, OpcodeId::PEXTRD, OPRS2(r32, xmm), OpcodeId::PEXTRD, OPRS2(m32, xmm));
+    table[0x16].slots[1].opcode_reg_w = OpcodeId::PEXTRQ;
+    table[0x16].slots[1].opcode_mem_w = OpcodeId::PEXTRQ;
+    table[0x16].slots[1].rex_w_reg    = 0b01;
+    table[0x16].slots[1].rex_w_mem    = 0b01;
+    table[0x17] = SimdSingleSlotRow(1, OpcodeId::EXTRACTPS, OPRS2(r32, xmm), OpcodeId::EXTRACTPS, OPRS2(m32, xmm));
+    // Insert family: the SDM source classes (PINSRB r32/m8, INSERTPS
+    // xmm/m32, PINSRD r32/m32 → PINSRQ r64/m64 under REX.W).
+    table[0x20] = SimdSingleSlotRow(1, OpcodeId::PINSRB, OPRS2(xmm, r32), OpcodeId::PINSRB, OPRS2(xmm, m8));
+    table[0x21] = SimdSingleSlotRow(1, OpcodeId::INSERTPS, OPRS2(xmm, xmm), OpcodeId::INSERTPS, OPRS2(xmm, m32));
+    table[0x22] = SimdSingleSlotRow(1, OpcodeId::PINSRD, OPRS2(xmm, r32), OpcodeId::PINSRD, OPRS2(xmm, m32));
+    table[0x22].slots[1].opcode_reg_w = OpcodeId::PINSRQ;
+    table[0x22].slots[1].opcode_mem_w = OpcodeId::PINSRQ;
+    table[0x22].slots[1].rex_w_reg    = 0b10; // source widens; the xmm stays xmm
+    table[0x22].slots[1].rex_w_mem    = 0b10;
+    // Uniform imm8 rows: DPPS/DPPD/MPSADBW/PCLMULQDQ, the SSE4.2 string
+    // group (60-63; implied XMM0/ECX destinations are NOT reported — the
+    // operand contract is the two explicit operands + imm8), and the AES-NI
+    // key generation assist (66 0F 3A DF; 3A CC is SHA1RNDS4, out of scope).
+    table[0x40] = SimdPackedRow(OpcodeId::DPPS);
+    table[0x41] = SimdPackedRow(OpcodeId::DPPD);
+    table[0x42] = SimdPackedRow(OpcodeId::MPSADBW);
+    table[0x44] = SimdPackedRow(OpcodeId::PCLMULQDQ);
+    table[0x60] = SimdPackedRow(OpcodeId::PCMPESTRM);
+    table[0x61] = SimdPackedRow(OpcodeId::PCMPESTRI);
+    table[0x62] = SimdPackedRow(OpcodeId::PCMPISTRM);
+    table[0x63] = SimdPackedRow(OpcodeId::PCMPISTRI);
+    table[0xDF] = SimdPackedRow(OpcodeId::AESKEYGENASSIST);
+
+    // imm8 on every defined row (the imm_kind default is none, so it is set
+    // explicitly here).
+    for (const auto op3 : { 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+                            0x14, 0x15, 0x16, 0x17, 0x20, 0x21, 0x22,
+                            0x40, 0x41, 0x42, 0x44,
+                            0x60, 0x61, 0x62, 0x63, 0xDF }) {
+        table[op3].imm_kind = SimdImmKind::imm8;
+    }
+
+    // Not enumerated (stay INVALID in every slot): the SHA rows (3A CC
+    // SHA1RNDS4), the AMD two-immediate EXTRQ/INSERTQ forms (verified to live
+    // in the two-byte space, 66/F2 0F 78/79), and every reserved third byte.
+    return table;
+}();
+
+// Shared 3-byte (0F 38 / 0F 3A) dispatch: opcode3 table select, then the
+// same ModR/M length conventions and full-encoding in-buffer contract as
+// DecodeSimd2Byte, with +1 for the third opcode byte on successful lengths.
+// Used by both the x64 and x86 Decode2ByteOpcode paths (dispatch code 0x3E).
+// `rex_w` is false in 32-bit mode (no REX prefixes there); `addr16` is true
+// for the 32-bit path under a 67h prefix (16-bit addressing: no SIB byte,
+// disp16 where the 32-bit form has none).
+template <typename PrefixInfoT>
+constexpr auto Dispatch3ByteOpcode(const PrefixInfoT& prefix_info, const gsl::span<const uint8_t> buffer,
+                                   const uint8_t opcode2, const bool rex_w, const bool addr16 = false) noexcept
+    -> DecodedInstruction
+{
+    // opcode3 must be in-buffer before it is read.
+    if (buffer.size() <= static_cast<size_t>(prefix_info.length + 2)) {
+        return ERR_INSUFFICIENT_BUFFER;
+    }
+    if (opcode2 != 0x38 && opcode2 != 0x3A) {
+        return ERR_UNDEFINED_INSTRUCTION;
+    }
+    const auto opcode3 = buffer[prefix_info.length + 2];
+    const auto& row = (opcode2 == 0x38) ? kDecodeTable_0F38[opcode3] : kDecodeTable_0F3A[opcode3];
+
+    // LOCK is #UD on every 0F 38/0F 3A row (SDM exception tables: MOVBE,
+    // CRC32 and all SIMD rows carry "#UD (LockPrefix)"). Rejected at the
+    // shared entry for both tables and both prefix policies.
+    if (prefix_info.has_prefix.has_lock != 0) {
+        return ERR_UNDEFINED_INSTRUCTION;
+    }
+
+    // ModR/M must be in-buffer before it is read.
+    if (buffer.size() <= static_cast<size_t>(prefix_info.length + 3)) {
+        return ERR_INSUFFICIENT_BUFFER;
+    }
+
+    uint8_t slot_index = 0;
+    const bool has_66 = prefix_info.has_prefix.has_66 != 0;
+    if (row.prefix_policy == SimdPrefixPolicy::Default) {
+        if (!SelectSimdSlot(prefix_info, slot_index)) {
+            return ERR_UNDEFINED_INSTRUCTION;
+        }
+    } else {
+        // Size-override rows (MOVBE/CRC32): no REP → none slot (MOVBE),
+        // F2 → F2 slot (CRC32), F3 → UNDEFINED. 66h does not select a slot.
+        if (prefix_info.rep_byte == 0xF3) {
+            return ERR_UNDEFINED_INSTRUCTION;
+        }
+        slot_index = (prefix_info.rep_byte == 0xF2) ? 3u : 0u;
+    }
+
+    const auto modrm  = buffer[prefix_info.length + 3];
+    uint8_t modrm_len = 0;
+    if (addr16) {
+        // 16-bit addressing: no SIB byte; disp16 where the 32-bit form has none.
+        modrm_len = kLengthTable_ModRM_Addr16[modrm];
+    } else {
+        modrm_len = kLengthTable_ModRM[modrm];
+
+        // For mod=00,r/m=100, SIB is present. If SIB.base=101, disp32 is mandatory.
+        if (ModrmHasSib(modrm)) {
+            if (buffer.size() <= static_cast<size_t>(prefix_info.length + 4)) {
+                return ERR_INSUFFICIENT_BUFFER;
+            }
+            if (const auto sib = buffer[prefix_info.length + 4];
+                (modrm & 0b11'000'000u) == 0b00'000'000u
+                && (sib & 0b000'000'111u) == 0b000'000'101u) {
+                modrm_len = static_cast<uint8_t>(modrm_len + 4);
+            }
+        }
+    }
+
+    const auto [length, instrId] = DecodeSimdRow(
+        row, slot_index, rex_w, modrm, modrm_len,
+        row.prefix_policy == SimdPrefixPolicy::SizeOverride && has_66);
+    if (length >= 0xE0) {
+        return { length, instrId };
+    }
+    // +1 for the third opcode byte on top of the engine's opcode2-relative
+    // length; the full encoding (prefixes, all three opcode bytes, ModR/M,
+    // SIB/displacement and any trailing immediate) must be in-buffer before
+    // success, mirroring the two-byte SIMD path.
+    const auto total = static_cast<uint8_t>(length + 1);
+    if (buffer.size() < static_cast<size_t>(prefix_info.length) + total) {
+        return ERR_INSUFFICIENT_BUFFER;
+    }
+    return { static_cast<uint8_t>(prefix_info.length + total), instrId };
+}
+
 static constexpr std::array<DecodeTableEntry, 256> kDecodeTable_2byte_opcode_shared{ {
     /*
        0xE1 = valid 0x0F opcode space but decode path is not implemented yet.
@@ -2024,12 +2365,14 @@ static constexpr std::array<DecodeTableEntry, 256> kDecodeTable_2byte_opcode_sha
        0x63 = 0F opcode-extension dispatch (currently 0F BA).
        0x64 = 0F C3 /r MOVNTI.
        0x65/0x66 = SIMD rows dispatched through kSimdOpcodeTable + DecodeSimd2Byte.
+       0x3E = 0F 38/0F 3A third-byte dispatch through kDecodeTable_0F38/_0F3A
+              + Dispatch3ByteOpcode.
     */
     /*       0                                    1                                 2                                 3                              4                                    5                                 6                                 7                                 8                              9                                    A                                 B                              C                                    D                                 E                                 F                              */
     /* 00 */ DTE(0x5E, IID_INVALID),        DTE(0x5F, IID_INVALID),        DTE(0x57, IID(LAR, r32, r16)), DTE(0x57, IID(LSL, r32, r16)), DTE(0xE1, IID_INVALID),        DTE(0x02, IID(SYSCALL)), DTE(0x02, IID(CLTS)),    DTE(0x02, IID(SYSRET)),  DTE(0x02, IID(INVD)),    DTE(0x02, IID(WBINVD)),  DTE(0xE1, IID_INVALID),        DTE(0x02, IID(UD)),      DTE(0xE1, IID_INVALID),        DTE(0x62, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),
     /* 10 */ DTE(0x65, IID(MOVUPS)),        DTE(0x65, IID(MOVUPS)),        DTE(0x66, IID(MOVHLPS)),       DTE(0x66, IID(MOVLPS)),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x66, IID(MOVLHPS)),       DTE(0x66, IID(MOVHPS)),        DTE(0x62, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x62, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x62, IID_INVALID),        DTE(0x5A, IID(NOP)),
     /* 20 */ DTE(0x60, IID(MOV, r64, creg)), DTE(0x60, IID(MOV, r64, dr)),   DTE(0x60, IID(MOV, creg, r64)), DTE(0x60, IID(MOV, dr, r64)),   DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x65, IID(MOVAPS)),        DTE(0x65, IID(MOVAPS)),        DTE(0x66, IID(CVTSI2SS)),      DTE(0xE1, IID_INVALID),        DTE(0x66, IID(CVTTSS2SI)),     DTE(0x66, IID(CVTSS2SI)),      DTE(0x65, IID(UCOMISS)),       DTE(0x65, IID(COMISS)),
-    /* 30 */ DTE(0x02, IID(WRMSR)),         DTE(0x02, IID(RDTSC)),          DTE(0x02, IID(RDMSR)),          DTE(0x02, IID(RDPMC)),          DTE(0x02, IID(SYSENTER)),       DTE(0x02, IID(SYSEXIT)),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),
+    /* 30 */ DTE(0x02, IID(WRMSR)),         DTE(0x02, IID(RDTSC)),          DTE(0x02, IID(RDMSR)),          DTE(0x02, IID(RDPMC)),          DTE(0x02, IID(SYSENTER)),       DTE(0x02, IID(SYSEXIT)),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x3E, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0x3E, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),        DTE(0xE1, IID_INVALID),
     /* 40 */ DTE(0x00, IID(CMOVO, Gv_Ev)),  DTE(0x00, IID(CMOVNO, Gv_Ev)), DTE(0x00, IID(CMOVB, Gv_Ev)),  DTE(0x00, IID(CMOVAE, Gv_Ev)), DTE(0x00, IID(CMOVZ, Gv_Ev)),  DTE(0x00, IID(CMOVNZ, Gv_Ev)), DTE(0x00, IID(CMOVBE, Gv_Ev)), DTE(0x00, IID(CMOVA,  Gv_Ev)), DTE(0x00, IID(CMOVS,  Gv_Ev)), DTE(0x00, IID(CMOVNS, Gv_Ev)), DTE(0x00, IID(CMOVP,  Gv_Ev)), DTE(0x00, IID(CMOVNP, Gv_Ev)), DTE(0x00, IID(CMOVL,  Gv_Ev)), DTE(0x00, IID(CMOVGE, Gv_Ev)), DTE(0x00, IID(CMOVLE, Gv_Ev)), DTE(0x00, IID(CMOVG,  Gv_Ev)),
     /* 50 */ DTE(0x66, IID(MOVMSKPS)),      DTE(0x66, IID(SQRTPS)),        DTE(0x66, IID(RSQRTPS)),       DTE(0x66, IID(RCPPS)),         DTE(0x66, IID(ANDPS)),         DTE(0x66, IID(ANDNPS)),        DTE(0x66, IID(ORPS)),          DTE(0x66, IID(XORPS)),         DTE(0x66, IID(ADDPS)),         DTE(0x66, IID(MULPS)),         DTE(0x66, IID(CVTPS2PD)),      DTE(0x66, IID(CVTDQ2PS)),      DTE(0x66, IID(SUBPS)),         DTE(0x66, IID(MINPS)),         DTE(0x66, IID(DIVPS)),         DTE(0x66, IID(MAXPS)),
     /* 60 */ DTE(0x66, IID(PUNPCKLBW)),     DTE(0x66, IID(PUNPCKLWD)),     DTE(0x66, IID(PUNPCKLDQ)),     DTE(0x66, IID(PACKSSWB)),      DTE(0x66, IID(PCMPGTB)),       DTE(0x66, IID(PCMPGTW)),       DTE(0x66, IID(PCMPGTD)),       DTE(0x66, IID(PACKUSWB)),      DTE(0x66, IID(PUNPCKHBW)),     DTE(0x66, IID(PUNPCKHWD)),     DTE(0x66, IID(PUNPCKHDQ)),     DTE(0x66, IID(PACKSSDW)),      DTE(0x66, IID(PUNPCKLQDQ)),    DTE(0x66, IID(PUNPCKHQDQ)),    DTE(0x66, IID(MOVD)),          DTE(0x66, IID(MOVDQA)),

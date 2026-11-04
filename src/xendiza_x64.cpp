@@ -744,6 +744,11 @@ auto X64Traits::Decode2ByteOpcode(
     case 0x66:
         return DecodeSimd2Byte(prefix_info, buffer, opcode2, prefix_info.rex_w());
 
+    // 0F 38/0F 3A: three-byte opcode space (SSSE3/SSE4.x/AES/PCLMUL/CRC32/
+    // MOVBE) dispatched through kDecodeTable_0F38/_0F3A + Dispatch3ByteOpcode.
+    case 0x3E:
+        return Dispatch3ByteOpcode(prefix_info, buffer, opcode2, prefix_info.rex_w());
+
     case 0xD6:
         return ERR_UNDEFINED_INSTRUCTION;
 
