@@ -150,8 +150,8 @@ Capstone note:
 ```bash
 cmake -S . -B build -DXENDIZA_BENCH_WITH_ZYDIS=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target xendiza_bench_avx
-./build/xendiza_bench_avx.exe --isa avx  --mode 64 --iters 10
-./build/xendiza_bench_avx.exe --isa avx2 --mode 64 --iters 10
+./build/xendiza_bench_avx.exe --isa avx  --mode 64 --inner-iters 10 --samples 10
+./build/xendiza_bench_avx.exe --isa avx2 --mode 64 --inner-iters 10 --samples 10
 ```
 
 See `bench/README.md` for full AVX/AVX2 results, corpus construction, and interpretation.
@@ -183,13 +183,16 @@ All decoders completed with `decoded=86009850`, `errors=0` on this corpus.
   - Non-memory segment-register instructions (for example `PUSH FS`, `POP GS`, `MOV Sreg, r/m16`) remain unchanged.
 - Concrete register identity and index expansion are out of current scope (including opcode-embedded register ids, `REX.B/R/X` extended-register ids, VEX `R/X/B` extended vector-register ids, x87 `ST(i)` concrete index expansion, and VSIB concrete index registers).
 
-### Independent ISA extensions (not covered)
+### AVX/AVX2 capability boundary
 
-AVX/AVX2 coverage is defined by the concrete VEX encodings in `test/data/vex_avx_inventory.csv`. The following independent ISA extensions are intentionally outside this boundary and their absence is not treated as a coverage gap: AVX-512 (EVEX), XOP, FMA3, F16C, BMI/BMI2, AES, PCLMULQDQ, and other non-VEX/non-AVX2 extensions.
+AVX/AVX2 coverage is defined by the concrete VEX encodings in `test/data/vex_avx_inventory.csv`. Independent ISA extensions do not enlarge this AVX/AVX2 boundary: AVX-512 (EVEX), XOP, FMA3, F16C, BMI/BMI2, and other non-VEX/non-AVX2 extensions remain outside it. Legacy AES-NI and PCLMULQDQ encodings are covered by the SSE decode tables; only the VEX `VPCLMULQDQ` form remains outside this change's VEX boundary.
 
 ### x86-64 (64-bit path) specific
 
-- A focused `0x0F` two-byte subset is implemented: `Jcc rel32`, `CMOVcc`, `IMUL r,r/m`, `BSF`, `BSR`, `MOVZX`/`MOVSX` (`0F B6/B7/BE/BF`), `CMPXCHG` (`0F B0/B1`), `XADD` (`0F C0/C1`), `BT/BTS/BTR/BTC` (`0F A3/AB/B3/BB`), `BT/BTS/BTR/BTC` immediate group (`0F BA /4-/7`, `imm8`), `SETcc` (`0F 90-9F`), `BSWAP` (`0F C8-CF`), multibyte `NOP` (`0F 1F /0`), `SHLD`/`SHRD` (`0F A4/A5/AC/AD`), plus P2.4 SIMD forms: `MOVUPS` (`0F 10/11`), `MOVAPS` (`0F 28/29`), `UCOMISS/COMISS` (`0F 2E/2F`), `66`-prefixed `UCOMISD/COMISD`, and arithmetic families `0F 58/59/5C/5E` with prefix remap to `PS/PD/SS/SD`.
+- A focused `0x0F` two-byte subset is implemented: `Jcc rel32`, `CMOVcc`, `IMUL r,r/m`, `BSF`, `BSR`, `MOVZX`/`MOVSX` (`0F B6/B7/BE/BF`), `CMPXCHG` (`0F B0/B1`), `XADD` (`0F C0/C1`), `BT/BTS/BTR/BTC` (`0F A3/AB/B3/BB`), `BT/BTS/BTR/BTC` immediate group (`0F BA /4-/7`, `imm8`), `SETcc` (`0F 90-9F`), `BSWAP` (`0F C8-CF`), multibyte `NOP` (`0F 1F /0`), `SHLD`/`SHRD` (`0F A4/A5/AC/AD`).
+- Legacy-encoded SSE1/SSE2 is implemented as a shared descriptor table driven by a generic engine (both modes): packed moves (`MOVUPS`/`MOVAPS`/`MOVDQA`/`MOVDQU` `0F 10/11/28/29`, `66/F3 0F 6F/7F`), compares (`UCOMISS/COMISS/UCOMISD/COMISD`, `0F 2E/2F`), mandatory-prefix-remapped arithmetic/logical/CVT families (`0F 51/52/53/54-57/58/59/5A/5B/5C/5D/5E/5F`, `66/F2/F3 0F E6`, `66/F2 0F D0`, `66/F2 0F 7C/7D`), irregular moves and conversions (`0F 12/13/16/17`, `0F 50`, `F2/F3 0F 2A/2C/2D`, `66 0F 6E`, `66/F3 0F 7E`, `66 0F D6/D7/E7/F7`, `F3 0F 12/16`), trailing-immediate forms (`0F C2/C6`, `66/F3/F2 0F 70`, `66 0F C4/C5`, `66 0F 71/72/73` shift groups), and the `66`-mandatory packed-integer block as an explicit per-row enumeration (`0F 60-6D/6F`, `74-76`, `7F`, `D1-D5`, `D8-F6`, `F8-FE` minus dedicated rows). `REX.W` widens the marked GPR operands (`CVTSI2SS/SD`, `CVTT*2SI`, `MOVD`→`MOVQ`); invalid prefix combinations and MMX forms decode as `UNDEFINED_INSTRUCTION`.
+- **MMX strict rejection:** packed-integer opcodes without the mandatory `66h` and encodings with MMX (`mm`) register operands decode as `UNDEFINED_INSTRUCTION`; no `mm` operand types are reported.
+- Three-byte opcode space (`0F 38`/`0F 3A`) is implemented as second-level descriptor tables (`SSSE3`/`SSE4.1`/`SSE4.2`/AES-NI/PCLMULQDQ rows, `imm8` trailing immediates on every `0F 3A` row) through the same generic engine: SSSE3 packed rows (`66 0F 38 00-0B`, `1C-1E`, `66 0F 3A 0F`), SSE4.1 (BLENDV*/PBLENDVB with the implied XMM0 mask unreported, PTEST, PMOVSX*/PMOVZX* per-row memory classes, MOVNTDQA memory-source-only, PACKUSDW, PCMPEQQ, PMULLD, PHMINPOSUW, ROUND* m128/m128/m32/m64, BLENDPS/PD, `PEXTRB/W/D(/Q)` and `PINSRB/INSERTPS/PINSRD(/Q)` with `REX.W` mnemonic overrides, EXTRACTPS, DPPS/DPPD, MPSADBW), SSE4.2 (`PCMPESTR*`/`PCMPISTR*` with implied EAX/EDX(/ECX) unreported, PCMPGTQ), AES-NI (`AESIMC`, `AESENC/AESENCLAST/AESDEC/AESDECLAST`, `AESKEYGENASSIST` at `3A DF`), and PCLMULQDQ. The shared `38 F0/F1` rows carry both `MOVBE` (no-REP, memory-only, `66` shrinks / `REX.W` widens) and `CRC32` (`F2`, register+memory, `66` shrinks only the `F1` source, `REX.W` widens); `F3` on those bytes decodes undefined. ADCX/ADOX (`0F 38 F6/F7`) and the SHA rows stay `UNDEFINED_INSTRUCTION`.
 - **VEX/AVX/AVX2**: complete `0F`, `0F 38`, and `0F 3A` map coverage with C4/C5 prefix recognition, NDS (non-destructive source) operands, L=0/1 vector-width selection, W/vvvv policies, immediate and `/is4` trailing bytes, and AVX2 VSIB/gather forms. Gather destination/mask/vector-index register overlap is enforced internally and returns `UNDEFINED_INSTRUCTION` when any two coincide.
 - System/privileged decode: Group 6 (`0F 00`: `SLDT`/`STR`/`LLDT`/`LTR`/`VERR`/`VERW`), Group 7 (`0F 01`: `SGDT`/`SIDT`/`LGDT`/`LIDT`/`SMSW`/`LMSW`/`INVLPG` plus register forms `SWAPGS`/`RDTSCP`/`MONITOR`/`MWAIT`/`CLAC`/`STAC`/`XGETBV`/`XSETBV`/`XTEST`/`RDPKRU`/`WRPKRU`/`SERIALIZE`), Group 16 (`0F 18`: `PREFETCHNTA/T0/T1/T2`), `CLDEMOTE` (`0F 1C`), `ENDBR64`/`ENDBR32` (`F3 0F 1E FA/FB`), `MOV` to/from control and debug registers (`0F 20-23`), Group 9 (`0F C7`: `CMPXCHG8B`, `CMPXCHG16B`, `RDRAND`, `RDSEED`, `XRSTORS`/`XSAVEC`/`XSAVES`, `RDPID`), and `0F AE` (`FXSAVE`/`FXRSTOR`/`LDMXCSR`/`STMXCSR`/`LFENCE`/`MFENCE`/`SFENCE`/`CLFLUSH`).
 - x87 core one-byte family (`D8`-`DF`) is implemented with abstract operand forms, including stack forms (`st0`/`sti`), floating memory forms (`m32fp`/`m64fp`/`m80fp`), environment/control forms (`FLDENV`/`FNSTENV`/`FSAVE`/`FRSTOR`), BCD forms (`FBLD`/`FBSTP`), and strict `FWAIT` vs `FN*` distinction.
@@ -199,10 +202,11 @@ AVX/AVX2 coverage is defined by the concrete VEX encodings in `test/data/vex_avx
 - Same 1-byte opcode map coverage as the x64 path, adapted for 32-bit default operand sizes (no `REX` prefix, `0x66` toggles 32↔16 instead of 64↔16).
 - Segment override prefix parsing (`CS`/`SS`/`DS`/`ES`/`FS`/`GS`) with composite memory operand reporting (for example `ds_moffs32`, `fs_m32`).
 - Opcode-embedded `INC`/`DEC` (`0x40–0x4F`) decoded as `INC`/`DEC` `r32`/`r16` (rather than REX prefix bytes).
-- `0x0F` two-byte subset mirrors the x64 coverage for the `MOVZX`/`MOVSX`, bit-test, `SETcc`, `BSWAP`, `SHLD`/`SHRD`, SIMD, and `0F AE` fence/flush families; integer width is 32-bit by default.
+- `0x0F` two-byte subset mirrors the x64 coverage for the `MOVZX`/`MOVSX`, bit-test, `SETcc`, `BSWAP`, `SHLD`/`SHRD`, legacy SSE1/SSE2, and `0F AE` fence/flush families; integer width is 32-bit by default (GPR-bearing SIMD forms report `r32`/`m32`).
 - **VEX/AVX/AVX2**: same `0F`/`0F 38`/`0F 3A` map coverage as x64, with 32-bit-mode restrictions applied. `C4/C5` with second-byte `mod!=11` retain their legacy decode rather than being consumed as VEX; `C4 00`/`C5 00` preserve their pre-change legacy results.
 - Group 6 (`0F 00`), Group 7 (`0F 01`), Group 16 (`0F 18`), `PREFETCH` (`0F 18`), `0F BA` bit ops, `MOVNTI` (`0F C3`), and Group 9 (`0F C7`) are implemented for x86-32 (no `CMPXCHG16B`; GPR size is `r32` instead of `r64`).
 - `F3`-prefixed register forms of `0F AE` (`RDFSBASE`/`RDGSBASE`/`WRFSBASE`/`WRGSBASE`) are x64-only and return `UNDEFINED_INSTRUCTION` in x86-32 mode.
+- Three-byte opcode space (`0F 38`/`0F 3A`) mirrors the x64 coverage for the SSSE3 packed-integer rows (`66 0F 38 00-0B`, `1C-1E`, `66 0F 3A 0F`), SSE4.1 (BLENDV*/PBLENDVB, PTEST, PMOVSX*/PMOVZX* with per-row memory classes, MOVNTDQA, PACKUSDW, PCMPEQQ, PMULLD, PHMINPOSUW, ROUND*, BLENDPS/PD, PEXTRB/W/D/Q, EXTRACTPS, PINSRB/INSERTPS/PINSRD, DPPS/DPPD, MPSADBW), SSE4.2 (`PCMPESTR*`/`PCMPISTR*`, PCMPGTQ), AES-NI (AESIMC + round instructions, AESKEYGENASSIST), and PCLMULQDQ; 16-bit addressing (`67h`) applies, and REX.W-only forms (PEXTRQ/PINSRQ) are structurally absent.
 
 ## Authorship
 

@@ -52,24 +52,27 @@ cmake --build build_ninja --target xendiza_bench
 # A single raw-bytes file (e.g. your own .text dump)
 ./xendiza_bench.exe --file path/to/code.bin [--iters N]
 
-# One or more bundled fixtures (real system-DLL .text sections)
+# One or more bundled fixtures
 ./xendiza_bench.exe --fixture ntdll [--fixture kernelbase] [--iters N]
+
+# SIMD-heavy OpenSSL .text slice
+./xendiza_bench.exe --fixture openssl-simd --iters 30
 ```
 
 Corpus source priority: `--file` > `--fixture` (concatenated) > synthetic seed.
 
 ## Fixtures
 
-Real `.text` sections extracted from Windows system DLLs via
-`bench/fixtures/extract_text.py` (zero-dependency minimal PE parser). See
-`bench/fixtures/README.md` for provenance, SHA256, and re-extraction
-instructions.
+The bundled fixtures include Windows system DLL `.text` sections and a
+SIMD-heavy OpenSSL `.text` slice. See [the fixture documentation](fixtures/README.md)
+for instruction counts, provenance, hashes, and extraction instructions.
 
-The fixtures contain a realistic mix of legacy + SSE + AVX instructions. The
-historical fixture results below were recorded before the current AVX/AVX2
-implementation and include coverage-related resync errors from that revision;
-they are not a fresh measurement of current AVX/AVX2 support. Re-run the fixture
-commands when using these numbers to evaluate a newer revision.
+The bundled fixtures contain a realistic mix of legacy, SSE, and AVX
+instructions. The historical system-DLL results below were recorded before the
+current AVX/AVX2 implementation and include coverage-related resynchronization
+errors from that revision; they are not fresh measurements of current AVX/AVX2
+support. The OpenSSL fixture remains useful for measuring a mixed workload of
+supported decoding and resynchronization on SIMD-heavy code.
 
 ## Results
 
