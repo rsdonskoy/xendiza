@@ -1,6 +1,7 @@
 #include <xendiza/xendiza_x86.hpp>
 #include <xendiza/detail/vex.hpp>
 #include <xendiza/detail/vex_decode.hpp>
+#include <xendiza/detail/simd_decode.hpp>
 
 namespace xendiza::detail {
 

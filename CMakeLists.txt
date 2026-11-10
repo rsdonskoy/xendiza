@@ -12,6 +12,7 @@ add_library(xendiza STATIC
     src/xendiza_x86.cpp
     src/vex.cpp
     src/vex_decode.cpp
+    src/simd_decode.cpp
 )
 
 target_include_directories(xendiza

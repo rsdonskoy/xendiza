@@ -1,6 +1,7 @@
 #include <xendiza/xendiza_x64.hpp>
 #include <xendiza/detail/vex.hpp>
 #include <xendiza/detail/vex_decode.hpp>
+#include <xendiza/detail/simd_decode.hpp>
 
 #if defined(_MSC_VER)
 #define XENDIZA_FORCEINLINE __forceinline
