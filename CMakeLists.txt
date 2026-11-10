@@ -10,6 +10,8 @@ add_library(xendiza STATIC
     src/xendiza.cpp
     src/xendiza_x64.cpp
     src/xendiza_x86.cpp
+    src/vex.cpp
+    src/vex_decode.cpp
 )
 
 target_include_directories(xendiza
@@ -52,6 +54,18 @@ add_executable(xendiza_tests
     test/test_sse_m4.cpp
     test/test_x86_x64_0f38_0f3a.cpp
     test/test_perf_regression.cpp
+    test/test_perf_avx_a0.cpp
+    test/test_perf_avx_a1.cpp
+    test/test_perf_avx_a2a.cpp
+    test/test_perf_avx_a2b.cpp
+    test/test_perf_avx_a3.cpp
+    test/test_abi_baseline.cpp
+    test/test_vex_avx_a0.cpp
+    test/test_vex_avx_a1.cpp
+    test/test_vex_avx_a2a.cpp
+    test/test_vex_avx_a2b.cpp
+    test/test_vex_avx_a3.cpp
+    test/test_vex_avx_forms.cpp
 )
 
 target_link_libraries(xendiza_tests PRIVATE xendiza GTest::gtest GTest::gtest_main)
@@ -115,6 +129,55 @@ if(XENDIZA_BENCH_WITH_ZYDIS)
         message(WARNING "Zydis requested but not found; benchmark will build without Zydis")
     endif()
 endif()
+
+# AVX/AVX2 benchmark: deterministic corpora + xendiza vs Zydis comparison.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(AVX_CORPUS "${CMAKE_CURRENT_SOURCE_DIR}/bench/corpus_avx.bin")
+set(AVX2_CORPUS "${CMAKE_CURRENT_SOURCE_DIR}/bench/corpus_avx2.bin")
+add_custom_command(
+    OUTPUT ${AVX_CORPUS} ${AVX2_CORPUS}
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/bench/gen_avx_corpora.py" --isa avx --size 8388608 --output ${AVX_CORPUS}
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/bench/gen_avx_corpora.py" --isa avx2 --size 8388608 --output ${AVX2_CORPUS}
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/test/data/vex_avx_inventory.csv"
+            "${CMAKE_CURRENT_SOURCE_DIR}/bench/gen_avx_corpora.py"
+    COMMENT "Generating AVX/AVX2 benchmark corpora"
+)
+add_custom_target(avx_corpora DEPENDS ${AVX_CORPUS} ${AVX2_CORPUS})
+
+add_executable(xendiza_bench_avx
+    bench/bench_avx.cpp
+)
+
+target_link_libraries(xendiza_bench_avx PRIVATE xendiza)
+add_dependencies(xendiza_bench_avx avx_corpora)
+
+if(MSVC)
+    target_compile_options(xendiza_bench_avx PRIVATE /Zc:preprocessor)
+endif()
+
+if(XENDIZA_BENCH_WITH_ZYDIS)
+    if(TARGET Zydis::Zydis)
+        target_compile_definitions(xendiza_bench_avx PRIVATE XENDIZA_BENCH_WITH_ZYDIS=1)
+        target_link_libraries(xendiza_bench_avx PRIVATE Zydis::Zydis)
+    endif()
+endif()
+
+# Strict inventory differential harness (public C/C++ API entry points).
+add_executable(xendiza_diff_harness
+    test/diff/harness.cpp
+)
+target_link_libraries(xendiza_diff_harness PRIVATE xendiza)
+if(MSVC)
+    target_compile_options(xendiza_diff_harness PRIVATE /Zc:preprocessor)
+endif()
+
+# Deterministic smoke test for the AVX/AVX2 benchmark (requires Zydis).
+add_test(NAME xendiza_bench_avx_smoke
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/diff/test_bench_avx.py" $<TARGET_FILE:xendiza_bench_avx>
+)
+set_tests_properties(xendiza_bench_avx_smoke PROPERTIES
+    DEPENDS "xendiza_bench_avx;avx_corpora"
+)
 
 # Install
 include(GNUInstallDirs)

@@ -189,6 +189,15 @@ enum class Operand : uint16_t {
     dr6,   // DR6 debug register
     dr7,   // DR7 debug register
 
+    // AVX/AVX2 abstract vector operands appended at the end to preserve the
+    // numeric values of all pre-existing Operand identifiers.
+    ymm,   // YMM register (abstract, no concrete register number mapping)
+    m256,  // 256-bit memory operand
+    m32_vsib,  // VSIB vector-indexed 32-bit memory (gather)
+    m64_vsib,  // VSIB vector-indexed 64-bit memory (gather)
+    m128_vsib, // VSIB vector-indexed 128-bit memory
+    m256_vsib, // VSIB vector-indexed 256-bit memory
+
     invalid = 0xFFFF // Invalid operand
 };
 

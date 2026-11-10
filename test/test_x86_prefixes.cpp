@@ -266,15 +266,14 @@ TEST(X86InvalidTest, INTO_0xCE_undefined)
 
 TEST(X86InvalidTest, LES_LDS_0xC4_0xC5_decode_as_invalid_short)
 {
-    // 0xC4/0xC5 are LES/LDS in i386 but VEX prefixes in x64. The shared table
-    // marks them DTE(0x01, IID_INVALID): dispatch 0x01 is a valid 1-byte direct
-    // form that carries IID_INVALID, so they decode to a length-1 instruction
-    // with INVALID opcode (NOT the UNDEFINED_INSTRUCTION error code, which only
-    // arises from dispatch 0xD6). Asserting the actual shared-table behavior.
+    // With VEX support, a lone C4/C5 in 32-bit mode is no longer decodable as a
+    // length-1 LES/LDS instruction because the second byte is required to
+    // disambiguate VEX (mod=11) from legacy LES/LDS. It now reports
+    // INSUFFICIENT_BUFFER, while C4/C5 followed by a non-VEX second byte still
+    // falls back to the legacy path.
     for (const auto op : std::array<uint8_t, 2>{0xC4, 0xC5}) {
         auto result = Disasm32(std::array<uint8_t, 1>{op});
-        EXPECT_EQ(result.instrId.opcode, OpcodeId::INVALID_OPCODE) << "op=" << std::hex << (int)op;
-        EXPECT_EQ(result.length, 1) << "op=" << std::hex << (int)op;
+        EXPECT_EQ(result.length, static_cast<uint8_t>(ErrorCode::INSUFFICIENT_BUFFER)) << "op=" << std::hex << (int)op;
     }
 }
 
