@@ -17,3 +17,7 @@ test/diff/out/
 # AVX/AVX2 benchmark corpora are generated from the inventory at build time.
 bench/corpus_avx.bin
 bench/corpus_avx2.bin
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
