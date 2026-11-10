@@ -1,4 +1,6 @@
 #include <xendiza/xendiza_x86.hpp>
+#include <xendiza/detail/vex.hpp>
+#include <xendiza/detail/vex_decode.hpp>
 
 namespace xendiza::detail {
 
@@ -946,6 +948,19 @@ auto X86Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> D
 {
     if (buffer.empty()) {
         return ERR_INSUFFICIENT_BUFFER;
+    }
+
+    // In 32-bit mode, C4/C5 is only VEX when the second byte has mod=11.
+    // Otherwise fall through to the legacy path unchanged.
+    const auto [vex_status, vex_info] = VexRecognizer::Recognize(buffer, false, 32);
+    if (vex_status == VexStatus::Valid) {
+        return VexDecoder::Decode(buffer, vex_info);
+    }
+    if (vex_status == VexStatus::NeedMore) {
+        return ERR_INSUFFICIENT_BUFFER;
+    }
+    if (vex_status == VexStatus::Invalid) {
+        return ERR_UNDEFINED_INSTRUCTION;
     }
 
     const auto [prefix_info, prefix_error] = ProcessPrefix(buffer);

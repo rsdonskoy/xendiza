@@ -65,11 +65,11 @@ Real `.text` sections extracted from Windows system DLLs via
 `bench/fixtures/README.md` for provenance, SHA256, and re-extraction
 instructions.
 
-The fixtures contain a realistic mix of legacy + SSE + AVX instructions. xendiza
-reports a non-zero `errors` count on them because it does not cover AVX/SSE
-(unsupported opcodes trigger the `++off` byte-resync path). **This is expected
-and is exactly what the benchmark should measure**: the cost of resync in real
-code, and the net throughput advantage over Zydis (which decodes everything).
+The fixtures contain a realistic mix of legacy + SSE + AVX instructions. The
+historical fixture results below were recorded before the current AVX/AVX2
+implementation and include coverage-related resync errors from that revision;
+they are not a fresh measurement of current AVX/AVX2 support. Re-run the fixture
+commands when using these numbers to evaluate a newer revision.
 
 ## Results
 
@@ -105,34 +105,84 @@ prediction, L1-resident working set, no resync).
 | xendiza | 57.17 MiB/s | 17.06 | 32,035,920 | 279,600 | 0.87% |
 | zydis    | 39.84 MiB/s | 11.84 | 31,907,250 |   5,910 | 0.019% |
 
-### Interpretation
+### Historical interpretation
 
-On **real system-DLL `.text`**, xendiza is **~1.43×** faster than Zydis
-(57.17 vs 39.84 MiB/s combined), down from ~1.61× on the synthetic seed. The
-advantage shrinks because:
+In that revision's **real system-DLL `.text`** run, xendiza was **~1.43×** faster
+than Zydis (57.17 vs 39.84 MiB/s combined), down from ~1.61× on the synthetic
+seed. The advantage shrank because:
 
 1. **Resync cost** — ~0.87% of xendiza's decode attempts hit unsupported
-   opcodes (AVX/SSE/3-byte-escapes) and fall through to the `++off` byte-resync
-   slow path. Zydis, which covers the full ISA, has a 45× lower error rate
-   (0.019% — its errors are genuinely malformed/undefined bytes, not coverage
-   gaps).
-2. **Decode-count parity** — despite the resync overhead, xendiza decodes
+   opcodes (AVX/SSE/3-byte-escapes) and fell through to the `++off` byte-resync
+   slow path. Zydis had a 45× lower error rate (0.019%).
+2. **Decode-count parity** — despite the resync overhead, xendiza decoded
    32.04M vs Zydis's 31.91M instructions (0.4% more, from resync occasionally
-   splitting one long instruction into two short false-positive decodes). The
-   counts are close, confirming xendiza's instruction-boundary recovery is
-   largely correct on legacy code.
-3. **No cache/branch-prediction cheating** — the working set (3.6 MiB) exceeds
-   L1 and the instruction mix is diverse, so this reflects real-world linear
+   splitting one long instruction into two short false-positive decodes).
+3. **No cache/branch-prediction cheating** — the working set (3.6 MiB) exceeded
+   L1 and the instruction mix was diverse, so this reflected real-world linear
    sweep cost.
 
-**Bottom line for the two-stage pipeline use case** (xendiza fast-scan to
-locate points of interest, then Zydis for precise analysis): on real code,
-xendiza sustains a ~1.4× throughput advantage while correctly decoding >99% of
-instructions. The ~0.87% resync rate is the cost of incomplete AVX/SSE coverage;
-for a *locator* that only needs opcode + operand-class to flag candidate
-instructions (call/jmp/lea/mov-imm/mov-stack), this is an acceptable trade, and
-the located offsets should be re-validated by Zydis from a known-aligned anchor
-(function entry) to absorb the rare boundary-misalignment from resync.
+These observations describe the historical revision, including its then-incomplete
+AVX/SSE coverage; they do not quantify resync or decode accuracy for the current
+implementation.
+
+## AVX/AVX2 dedicated benchmark
+
+`xendiza_bench_avx` measures VEX/AVX/AVX2 decode throughput on deterministic,
+ISA-specific corpora built from `test/data/vex_avx_inventory.csv`. It requires
+Zydis (`-DXENDIZA_BENCH_WITH_ZYDIS=ON`).
+
+### Build
+
+```sh
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+      -DXENDIZA_BENCH_WITH_ZYDIS=ON ^
+      -DCMAKE_PREFIX_PATH=C:/devdrv/usr
+cmake --build build --target xendiza_bench_avx
+```
+
+The corpora are generated automatically as a build dependency. For these results,
+`bench/corpus_avx.bin` is 8,387,113 bytes and `bench/corpus_avx2.bin` is
+8,387,734 bytes.
+
+### Usage
+
+```sh
+./xendiza_bench_avx.exe --isa avx  --mode 64 --inner-iters 10 --samples 10
+./xendiza_bench_avx.exe --isa avx2 --mode 64 --inner-iters 10 --samples 10
+./xendiza_bench_avx.exe --isa avx  --mode 32 --inner-iters 10 --samples 10
+./xendiza_bench_avx.exe --isa avx2 --mode 32 --inner-iters 10 --samples 10
+```
+
+A correctness gate runs before timing: both decoders must produce identical
+instruction boundaries and zero errors on the whole corpus. The gate reports the
+first mismatch and aborts if anything differs.
+
+### Results
+
+Four independent runs, MSVC 19.44 / Ninja / Release, inner-iters=10, samples=10,
+Windows 11 10.0.26200, Zydis 4.1.1#1 (vcpkg).
+
+| ISA | Mode | Decoder | Throughput | Minsn/s | decoded | errors | checksum |
+|---|---:|---|---:|---:|---:|---:|---:|
+| AVX | 32 | xendiza | 134.32 MiB/s | 21.77 | 12,963,510 | 0 | 83,871,130 |
+| AVX | 32 | zydis    |  62.07 MiB/s | 10.06 | 12,963,510 | 0 | 83,871,130 |
+| AVX | 64 | xendiza | 123.92 MiB/s | 20.08 | 12,963,510 | 0 | 83,871,130 |
+| AVX | 64 | zydis    |  59.98 MiB/s |  9.72 | 12,963,510 | 0 | 83,871,130 |
+| AVX2 | 32 | xendiza | 146.38 MiB/s | 21.77 | 11,895,700 | 0 | 83,877,340 |
+| AVX2 | 32 | zydis    |  66.76 MiB/s |  9.93 | 11,895,700 | 0 | 83,877,340 |
+| AVX2 | 64 | xendiza | 135.53 MiB/s | 20.15 | 11,895,700 | 0 | 83,877,340 |
+| AVX2 | 64 | zydis    |  64.37 MiB/s |  9.57 | 11,895,700 | 0 | 83,877,340 |
+
+xendiza/Zydis throughput ratio: 2.066-2.193 on this pure AVX/AVX2 decode workload.
+
+### Interpretation
+
+These numbers are **not** directly comparable to the legacy benchmark above:
+`xendiza_bench_avx` exercises only VEX-encoded AVX/AVX2 instructions and compares
+xendiza's lightweight opcode/operand-class decode against Zydis' fuller semantic
+decode. On this workload xendiza is currently about **2×** faster, while the
+checksum parity confirms both decoders agree on every instruction boundary in the
+corpus. This benchmark is intended as a regression guard and optimization target.
 
 ## Re-running / updating results
 
@@ -144,6 +194,9 @@ python bench/fixtures/extract_text.py
 
 # Re-run (adjust --iters for stability)
 ./xendiza_bench.exe --fixture ntdll --fixture kernelbase --fixture kernel32 --iters 30
+
+# AVX/AVX2 benchmark
+./xendiza_bench_avx.exe --isa avx2 --mode 64 --inner-iters 30 --samples 10
 ```
 
 Update the tables above with the new numbers and the fixture SHA256s in

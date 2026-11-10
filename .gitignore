@@ -13,3 +13,7 @@ openspec/
 # differential-test harness (test/diff): track sources + third_party vectors,
 # ignore generated artifacts
 test/diff/out/
+
+# AVX/AVX2 benchmark corpora are generated from the inventory at build time.
+bench/corpus_avx.bin
+bench/corpus_avx2.bin

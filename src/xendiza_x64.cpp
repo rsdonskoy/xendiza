@@ -1,4 +1,6 @@
 #include <xendiza/xendiza_x64.hpp>
+#include <xendiza/detail/vex.hpp>
+#include <xendiza/detail/vex_decode.hpp>
 
 #if defined(_MSC_VER)
 #define XENDIZA_FORCEINLINE __forceinline
@@ -1144,6 +1146,21 @@ auto X64Traits::DecodeInstructionSlowPath(gsl::span<const uint8_t> buffer) noexc
     if (buffer.empty()) {
         return ERR_INSUFFICIENT_BUFFER;
     }
+
+    // VEX prefix recognition runs before legacy prefix parsing so that
+    // disallowed prefix combinations and effective address-size selection are
+    // handled by the VEX path, not the legacy REX/66 fixups.
+    const auto [vex_status, vex_info] = VexRecognizer::Recognize(buffer, true, 64);
+    if (vex_status == VexStatus::Valid) {
+        return VexDecoder::Decode(buffer, vex_info);
+    }
+    if (vex_status == VexStatus::NeedMore) {
+        return ERR_INSUFFICIENT_BUFFER;
+    }
+    if (vex_status == VexStatus::Invalid) {
+        return ERR_UNDEFINED_INSTRUCTION;
+    }
+
     const auto [prefix_info, prefix_error] = ProcessPrefix(buffer);
     if (prefix_error != ErrorCode::OK) {
         return ToErrorInstruction(prefix_error);
