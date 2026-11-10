@@ -68,25 +68,26 @@ SIMD-heavy OpenSSL `.text` slice. See [the fixture documentation](fixtures/READM
 for instruction counts, provenance, hashes, and extraction instructions.
 
 The bundled fixtures contain a realistic mix of legacy, SSE, and AVX
-instructions. The historical system-DLL results below were recorded before the
-current AVX/AVX2 implementation and include coverage-related resynchronization
-errors from that revision; they are not fresh measurements of current AVX/AVX2
-support. The OpenSSL fixture remains useful for measuring a mixed workload of
-supported decoding and resynchronization on SIMD-heavy code.
+instructions. The results below are from the implementation that includes the
+shared SSE tables and complete AVX/AVX2 VEX decoding. The OpenSSL slice also
+contains independent extensions outside the current boundary (including BMI,
+SHA, EVEX, and XOP bytes), so its linear-sweep error count includes both those
+coverage gaps and follow-on byte-resynchronization effects.
 
 ## Results
 
-Single run, MSVC 19.44 / Ninja / Release, 30 iterations, Windows 11 10.0.26200.
+Single run, MSVC 19.44 / Visual Studio 17 2022 / Release, 30 iterations,
+Windows 11 10.0.26200.
 
 ### Synthetic seed (79-byte tile, 8 MiB) — *regression baseline*
 
 | Decoder | Throughput | Decode rate | decoded | errors |
 |---|---:|---:|---:|---:|
-| xendiza | 61.41 MiB/s | 22.01 Minsn/s | 86,009,850 | 0 |
-| zydis    | 38.11 MiB/s | 13.66 Minsn/s | 86,009,850 | 0 |
+| xendiza | 57.67 MiB/s | 20.67 Minsn/s | 86,009,850 | 0 |
+| zydis    | 36.94 MiB/s | 13.24 Minsn/s | 86,009,850 | 0 |
 
 The seed only contains 1-byte legacy opcodes xendiza fully covers, so both
-decoders decode the same instructions with zero errors. xendiza is **~1.61×**
+decoders decode the same instructions with zero errors. xendiza is **~1.56×**
 faster here, but this number is optimistic (tiled seed = perfect branch
 prediction, L1-resident working set, no resync).
 
@@ -94,39 +95,51 @@ prediction, L1-resident working set, no resync).
 
 | Fixture | Bytes | Decoder | Throughput | Minsn/s | decoded | errors | err % |
 |---|---:|---|---:|---:|---:|---:|---:|
-| ntdll | 1,482,752 | xendiza | 55.75 MiB/s | 16.51 | 12,560,190 | 120,570 | 0.95% |
-|       |           | zydis    | 38.08 MiB/s | 11.23 | 12,512,940 |     780 | 0.006% |
-| kernelbase | 1,724,416 | xendiza | 59.85 MiB/s | 17.59 | 14,499,690 | 122,820 | 0.84% |
-|            |           | zydis    | 41.19 MiB/s | 12.05 | 14,433,690 |   4,980 | 0.034% |
-| kernel32 | 544,768 | xendiza | 56.85 MiB/s | 18.15 | 4,976,040 | 36,240 | 0.72% |
-|          |         | zydis    | 36.57 MiB/s | 11.64 | 4,960,620 |    180 | 0.004% |
+| ntdll | 1,482,752 | xendiza | 42.72 MiB/s | 12.60 | 12,517,860 |   4,920 | 0.039% |
+|       |           | zydis    | 30.22 MiB/s |  8.92 | 12,512,940 |     780 | 0.006% |
+| kernelbase | 1,724,416 | xendiza | 47.76 MiB/s | 13.97 | 14,433,720 |   5,430 | 0.038% |
+|            |           | zydis    | 34.36 MiB/s | 10.05 | 14,433,720 |   5,130 | 0.036% |
+| kernel32 | 544,768 | xendiza | 42.15 MiB/s | 13.41 | 4,960,620 |     240 | 0.005% |
+|          |         | zydis    | 31.38 MiB/s |  9.99 | 4,960,620 |     180 | 0.004% |
+| openssl-simd | 131,074 | xendiza | 44.55 MiB/s | 12.50 | 1,052,190 | 148,950 | 14.157% |
+|              |         | zydis    | 35.23 MiB/s |  8.90 |   946,920 |     150 | 0.016% |
 
-### All fixtures combined (3,751,936 bytes / 3.58 MiB)
+### System-DLL fixtures combined (3,751,936 bytes / 3.58 MiB)
 
 | Decoder | Throughput | Minsn/s | decoded | errors | err % |
 |---|---:|---:|---:|---:|---:|
-| xendiza | 57.17 MiB/s | 17.06 | 32,035,920 | 279,600 | 0.87% |
-| zydis    | 39.84 MiB/s | 11.84 | 31,907,250 |   5,910 | 0.019% |
+| xendiza | 46.69 MiB/s | 13.88 | 31,912,200 | 10,560 | 0.033% |
+| zydis    | 33.10 MiB/s |  9.84 | 31,907,280 |  6,060 | 0.019% |
 
-### Historical interpretation
+### All fixtures combined (3,883,010 bytes / 3.70 MiB)
 
-In that revision's **real system-DLL `.text`** run, xendiza was **~1.43×** faster
-than Zydis (57.17 vs 39.84 MiB/s combined), down from ~1.61× on the synthetic
-seed. The advantage shrank because:
+| Decoder | Throughput | Minsn/s | decoded | errors | err % |
+|---|---:|---:|---:|---:|---:|
+| xendiza | 46.76 MiB/s | 13.88 | 32,964,390 | 159,510 | 0.484% |
+| zydis    | 32.75 MiB/s |  9.69 | 32,854,200 |   6,210 | 0.019% |
 
-1. **Resync cost** — ~0.87% of xendiza's decode attempts hit unsupported
-   opcodes (AVX/SSE/3-byte-escapes) and fell through to the `++off` byte-resync
-   slow path. Zydis had a 45× lower error rate (0.019%).
-2. **Decode-count parity** — despite the resync overhead, xendiza decoded
-   32.04M vs Zydis's 31.91M instructions (0.4% more, from resync occasionally
-   splitting one long instruction into two short false-positive decodes).
-3. **No cache/branch-prediction cheating** — the working set (3.6 MiB) exceeded
-   L1 and the instruction mix was diverse, so this reflected real-world linear
-   sweep cost.
+### Interpretation
 
-These observations describe the historical revision, including its then-incomplete
-AVX/SSE coverage; they do not quantify resync or decode accuracy for the current
-implementation.
+On the three system-DLL corpora, xendiza's error count dropped from the
+pre-SSE/AVX recorded total of 279,600 to **10,560** (a 96.2% reduction), and
+its error rate fell from 0.87% to **0.033%**. Its decoded count is within
+0.02% of Zydis, so instruction-boundary recovery on ordinary system code is now
+close even though the two decoders still make different strict-legality choices
+on a small number of byte patterns.
+
+The combined system-DLL throughput ratio is ~**1.41×** (46.69 vs 33.10 MiB/s).
+The absolute xendiza throughput is lower than the historical fixture run because
+it now performs full SSE/AVX/AVX2 decoding instead of quickly rejecting those
+encodings and byte-resynchronizing; the comparative ratio remains essentially
+unchanged.
+
+OpenSSL is deliberately retained as a stress case. Its high error count is not
+a measure of missing SSE/AVX support: representative failures include BMI
+instructions such as `RORX`/`ANDN`, SHA-extension rows, EVEX, and XOP bytes,
+none of which are inside the documented AVX/AVX2 boundary. Because linear sweep
+resynchronizes one byte after an unsupported instruction, one real gap can also
+produce many downstream false errors; Zydis additionally accepts some encodings
+with non-reserved VEX fields that the Intel SDM makes architecturally invalid.
 
 ## AVX/AVX2 dedicated benchmark
 
