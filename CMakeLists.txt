@@ -5,6 +5,18 @@ set(CMAKE_CXX_STANDARD 20)
 
 option(XENDIZA_BENCH_WITH_CAPSTONE "Build benchmark with Capstone comparison" OFF)
 option(XENDIZA_BENCH_WITH_ZYDIS "Build benchmark with Zydis comparison" OFF)
+option(XENDIZA_ENABLE_LTO "Enable interprocedural optimization for xendiza and its consumers" OFF)
+
+if(XENDIZA_ENABLE_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT XENDIZA_IPO_SUPPORTED OUTPUT XENDIZA_IPO_ERROR LANGUAGES CXX)
+    if(NOT XENDIZA_IPO_SUPPORTED)
+        message(FATAL_ERROR "XENDIZA_ENABLE_LTO requested but IPO/LTO is unavailable: ${XENDIZA_IPO_ERROR}")
+    endif()
+    # Set this before creating any targets so the static library and the
+    # benchmark consumer are both built with compatible IPO/LTO settings.
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 add_library(xendiza STATIC
     src/xendiza.cpp
@@ -67,6 +79,7 @@ add_executable(xendiza_tests
     test/test_vex_avx_a2b.cpp
     test/test_vex_avx_a3.cpp
     test/test_vex_avx_forms.cpp
+    test/test_vex_direct_dispatch.cpp
 )
 
 target_link_libraries(xendiza_tests PRIVATE xendiza GTest::gtest GTest::gtest_main)
@@ -151,6 +164,9 @@ add_executable(xendiza_bench_avx
 
 target_link_libraries(xendiza_bench_avx PRIVATE xendiza)
 add_dependencies(xendiza_bench_avx avx_corpora)
+if(XENDIZA_ENABLE_LTO)
+    target_compile_definitions(xendiza_bench_avx PRIVATE XENDIZA_BENCH_WITH_LTO=1)
+endif()
 
 if(MSVC)
     target_compile_options(xendiza_bench_avx PRIVATE /Zc:preprocessor)

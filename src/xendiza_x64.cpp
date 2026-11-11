@@ -954,6 +954,59 @@ constexpr auto PrefixInfoForSinglePrefix(const Prefix kind, const uint8_t byte) 
     return info;
 }
 
+// Fast path for unprefixed x64 VEX input (buffer[0] is C4 or C5). Recognizes
+// the VEX fields directly, bypassing the general prefix-aware scan and its
+// noinline slow-path call. No leading prefix can be present — the caller only
+// routes byte zero here — so prefix_length is always 0 and the effective
+// address size is 64. C5 keeps its two-byte constants (map 0F, W=0); C4 reads
+// the third byte and rejects map zero. Once recognition succeeds, the shared
+// VexDecoder::Decode retains responsibility for opcode availability, form
+// selection, legality, sizing, and result construction. Missing VEX bytes
+// return INSUFFICIENT_BUFFER, matching the general recognizer's NeedMore.
+static auto DecodeUnprefixedVex64(gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction
+{
+    VexInfo info{};
+    info.prefix_length = 0;
+    info.is_64bit = true;
+    info.addr_size = 64;
+
+    if (buffer[0] == 0xC5) {
+        if (buffer.size() < 2) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
+        const auto second = buffer[1];
+        info.vex_length = 2;
+        info.map = 0x01; // 0F
+        info.pp = second & 0x03;
+        info.L = (second >> 2) & 0x01;
+        info.vvvv = (second >> 3) & 0x0F;
+        info.R = (second & 0x80) != 0;
+        info.W = 0;
+        info.opcode_offset = 2;
+    } else {
+        if (buffer.size() < 3) {
+            return ERR_INSUFFICIENT_BUFFER;
+        }
+        const auto second = buffer[1];
+        const auto third = buffer[2];
+        info.vex_length = 3;
+        info.map = second & 0x1F;
+        if (info.map == 0) {
+            return ERR_UNDEFINED_INSTRUCTION;
+        }
+        info.R = (second & 0x80) != 0;
+        info.X = (second & 0x40) != 0;
+        info.B = (second & 0x20) != 0;
+        info.W = (third >> 7) & 0x01;
+        info.vvvv = (third >> 3) & 0x0F;
+        info.L = (third >> 2) & 0x01;
+        info.pp = third & 0x03;
+        info.opcode_offset = 3;
+    }
+
+    return VexDecoder::Decode(buffer, info);
+}
+
 XENDIZA_NOINLINE
 auto X64Traits::DecodeInstructionSlowPath(gsl::span<const uint8_t> buffer) noexcept -> DecodedInstruction
 {
@@ -991,6 +1044,13 @@ auto X64Traits::DecodeInstruction(gsl::span<const uint8_t> buffer) noexcept -> D
     // prefixes, VEX/EVEX, and empty/tiny buffers take the slow path.
     if (!buffer.empty()) {
         const auto first_kind = X64Traits::kPrefixTable[buffer[0]];
+        if (first_kind == Prefix::VEX_2BYTE || first_kind == Prefix::VEX_3BYTE) {
+            // Unprefixed VEX: recognize C4/C5 fields directly instead of paying
+            // the general prefix scan and noinline slow-path call. A leading
+            // prefix never enters here, so prefixed VEX input still falls
+            // through to the slow path below.
+            return DecodeUnprefixedVex64(buffer);
+        }
         if (first_kind == Prefix::NONE || first_kind == Prefix::OPC_2BYTE) {
             return Decode1Byte(PrefixInfo{}, buffer);
         }

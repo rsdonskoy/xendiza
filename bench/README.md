@@ -173,32 +173,104 @@ A correctness gate runs before timing: both decoders must produce identical
 instruction boundaries and zero errors on the whole corpus. The gate reports the
 first mismatch and aborts if anything differs.
 
+### Measurement modes
+
+Each run reports four rows:
+
+- `xendiza-length`: consumes only `length`, preserving the historical timing
+  metric and the Zydis comparison.
+- `xendiza-full`: consumes `length`, opcode, operand count and all four
+  operands, preventing LTO from discarding semantic decode work as unused.
+  Its checksum intentionally differs from the length-only checksum.
+- `empty-floor`: replays the per-instruction length stream collected by the
+  correctness gate, retaining the outer loop, dependent offset update, error
+  branch and length checksum without doing any decoding. Its length-stream
+  load is part of the measurement; this is a floor, not a target throughput.
+- `zydis-length`: the existing Zydis boundary/length comparison.
+
+### LTO A/B measurement
+
+Use separate build directories with otherwise identical configuration:
+
+```sh
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+      -DXENDIZA_BENCH_WITH_ZYDIS=ON -DXENDIZA_ENABLE_LTO=OFF ^
+      -DCMAKE_PREFIX_PATH=C:/devdrv/usr
+cmake -B build_lto -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+      -DXENDIZA_BENCH_WITH_ZYDIS=ON -DXENDIZA_ENABLE_LTO=ON ^
+      -DCMAKE_PREFIX_PATH=C:/devdrv/usr
+cmake --build build --target xendiza_bench_avx
+cmake --build build_lto --target xendiza_bench_avx
+```
+
+`XENDIZA_ENABLE_LTO` enables interprocedural optimization before any project
+target is created, so both the static library and benchmark consumer use
+compatible IPO/LTO settings. The benchmark header prints `lto=on` or
+`lto=off`. Compare both length-only and full-metadata rows with identical
+benchmark arguments; the LTO delta also includes constant propagation, dead
+code elimination and code-layout effects, not just call overhead.
+
 ### Results
 
-Four independent runs, MSVC 19.44 / Ninja / Release, inner-iters=10, samples=10,
-Windows 11 10.0.26200, Zydis 4.1.1#1 (vcpkg).
+Direct VEX dispatch (this branch): unprefixed x64 `C4/C5` input no longer
+runs the general prefix-recognition scan or the noinline slow-path call; the
+shared VEX decoder still makes every form/legality/sizing decision. Toolchain:
+MSVC 19.44 / Visual Studio 17 2022 / Release, inner-iters=10, samples=10
+(best-of-10), warmup=1, Windows 11 10.0.26200, Zydis 4.1.1#1 (vcpkg).
+"Before" is the pre-dispatch state of this branch, including the dual-metric
+benchmark and LTO controls, measured with identical benchmark arguments.
 
-| ISA | Mode | Decoder | Throughput | Minsn/s | decoded | errors | checksum |
-|---|---:|---|---:|---:|---:|---:|---:|
-| AVX | 32 | xendiza | 134.32 MiB/s | 21.77 | 12,963,510 | 0 | 83,871,130 |
-| AVX | 32 | zydis    |  62.07 MiB/s | 10.06 | 12,963,510 | 0 | 83,871,130 |
-| AVX | 64 | xendiza | 123.92 MiB/s | 20.08 | 12,963,510 | 0 | 83,871,130 |
-| AVX | 64 | zydis    |  59.98 MiB/s |  9.72 | 12,963,510 | 0 | 83,871,130 |
-| AVX2 | 32 | xendiza | 146.38 MiB/s | 21.77 | 11,895,700 | 0 | 83,877,340 |
-| AVX2 | 32 | zydis    |  66.76 MiB/s |  9.93 | 11,895,700 | 0 | 83,877,340 |
-| AVX2 | 64 | xendiza | 135.53 MiB/s | 20.15 | 11,895,700 | 0 | 83,877,340 |
-| AVX2 | 64 | zydis    |  64.37 MiB/s |  9.57 | 11,895,700 | 0 | 83,877,340 |
+64-bit mode, non-LTO (`build`, `-DXENDIZA_ENABLE_LTO=OFF`):
 
-xendiza/Zydis throughput ratio: 2.066-2.193 on this pure AVX/AVX2 decode workload.
+| ISA | Metric | Before | After |
+|---|---|---:|---:|
+| AVX  | xendiza-length | 122.03 MiB/s | 156.68 MiB/s |
+| AVX  | xendiza-full   | 106.60 MiB/s | 130.55 MiB/s |
+| AVX2 | xendiza-length | 133.93 MiB/s | 167.25 MiB/s |
+| AVX2 | xendiza-full   | 116.05 MiB/s | 138.94 MiB/s |
+
+64-bit mode, LTO (`build_lto`, `-DXENDIZA_ENABLE_LTO=ON`):
+
+| ISA | Metric | Before | After |
+|---|---|---:|---:|
+| AVX  | xendiza-length | 139.51 MiB/s | 175.60 MiB/s |
+| AVX  | xendiza-full   | 117.02 MiB/s | 142.02 MiB/s |
+| AVX2 | xendiza-length | 152.46 MiB/s | 185.71 MiB/s |
+| AVX2 | xendiza-full   | 128.13 MiB/s | 151.45 MiB/s |
+
+Every row kept identical decoded counts, zero errors, and identical checksums
+before and after (AVX: decoded=12,963,510, length checksum=83,871,130; AVX2:
+decoded=11,895,700, length checksum=83,877,340; full-metadata checksums
+unchanged as well). Empty-floor rows stay at ~10 GB/s in all runs; the floor
+measures only loop/offset overhead and is not a target.
+
+32-bit mode is an unchanged-path control: 129-143 MiB/s non-LTO and
+151-170 MiB/s LTO before and after (within run-to-run noise).
+
+#### Real `.text` fixture outcome (non-LTO, `--iters 30`)
+
+| Corpus | xendiza throughput | decoded | errors | checksum |
+|---|---:|---:|---:|---:|
+| system DLLs, before | 48.10 MiB/s | 31,912,200 | 10,560 | 157,920,180 |
+| system DLLs, after    | 49.50 MiB/s | 31,912,200 | 10,560 | 157,920,180 |
+| openssl-simd, before | 44.43 MiB/s | 1,052,190 | 148,950 | 5,777,040 |
+| openssl-simd, after    | 46.74 MiB/s | 1,052,190 | 148,950 | 5,777,040 |
+
+Decoded counts, error counts, and checksums are byte-identical before and
+after; no real-corpus regression was observed. The real corpora contain mostly
+non-VEX code, so the gain (+3-5%) is smaller than the tiled AVX/AVX2 synthetic
+rate (+20-28%); the synthetic rate must not be read as a general speedup.
 
 ### Interpretation
 
 These numbers are **not** directly comparable to the legacy benchmark above:
 `xendiza_bench_avx` exercises only VEX-encoded AVX/AVX2 instructions and compares
 xendiza's lightweight opcode/operand-class decode against Zydis' fuller semantic
-decode. On this workload xendiza is currently about **2×** faster, while the
+decode. On this workload xendiza is currently about **2.7-3.1×** faster
+(length-only metric, both LTO settings), while the
 checksum parity confirms both decoders agree on every instruction boundary in the
 corpus. This benchmark is intended as a regression guard and optimization target.
+
 
 ## Re-running / updating results
 

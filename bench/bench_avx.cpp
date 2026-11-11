@@ -202,6 +202,24 @@ auto TimeZydis(const std::vector<uint8_t>& corpus, bool is_64bit,
 }
 #endif
 
+template <bool FullMetadata>
+inline void AccumulateXendizaChecksum(const xendiza::DecodedInstruction& di, uint64_t& checksum)
+{
+    checksum += di.length;
+    if constexpr (FullMetadata) {
+        checksum += static_cast<uint16_t>(di.instrId.opcode);
+        checksum += di.instrId.operand_count;
+        for (const auto operand : di.instrId.operands.operand) {
+            checksum += static_cast<uint16_t>(operand);
+        }
+    }
+}
+
+// FullMetadata is a template parameter so the two measurements have identical
+// loop structure without a runtime metric-selection branch. The full variant
+// consumes every public result field, preventing LTO from discarding semantic
+// decode work merely because the caller only needs instruction boundaries.
+template <bool FullMetadata>
 auto TimeXendiza(const std::vector<uint8_t>& corpus, bool is_64bit,
                  uint32_t warmup, uint32_t inner_iters, uint32_t samples,
                  uint64_t& decoded, uint64_t& checksum) -> double
@@ -222,8 +240,57 @@ auto TimeXendiza(const std::vector<uint8_t>& corpus, bool is_64bit,
                     ++off;
                 } else {
                     ++local_decoded;
-                    local_checksum += di.length;
+                    AccumulateXendizaChecksum<FullMetadata>(di, local_checksum);
                     off += di.length;
+                }
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        decoded = local_decoded;
+        checksum = local_checksum;
+        return std::chrono::duration<double>(t1 - t0).count();
+    };
+
+    for (uint32_t i = 0; i < warmup; ++i) {
+        run_once();
+    }
+
+    double best = 0.0;
+    for (uint32_t i = 0; i < samples; ++i) {
+        const double seconds = run_once();
+        if (best == 0.0 || seconds < best) {
+            best = seconds;
+        }
+    }
+    return best;
+}
+
+// Empty-decoder floor: replay the length stream collected by the correctness
+// gate. This preserves the outer loop, dependent off update, error branch and
+// checksum work, but performs no prefix/table decoding. The extra byte load is
+// explicitly part of this floor; it is not presented as a target throughput.
+auto TimeEmptyFloor(const size_t corpus_size, const std::vector<uint8_t>& lengths,
+                    uint32_t warmup, uint32_t inner_iters, uint32_t samples,
+                    uint64_t& decoded, uint64_t& checksum) -> double
+{
+    decoded = 0;
+    checksum = 0;
+
+    auto run_once = [&]() -> double {
+        uint64_t local_decoded = 0;
+        uint64_t local_checksum = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (uint32_t it = 0; it < inner_iters; ++it) {
+            size_t off = 0;
+            size_t instruction = 0;
+            while (off < corpus_size) {
+                const auto length = lengths[instruction++];
+                if (length == 0) {
+                    ++off;
+                } else {
+                    ++local_decoded;
+                    local_checksum += length;
+                    off += length;
                 }
             }
         }
@@ -294,7 +361,12 @@ int main(int argc, char** argv)
               << " corpus=" << corpus.size() << " bytes"
               << " inner_iters=" << opt.inner_iters
               << " samples=" << opt.samples
-              << " warmup=" << opt.warmup << "\n";
+              << " warmup=" << opt.warmup
+#ifdef XENDIZA_BENCH_WITH_LTO
+              << " lto=on\n";
+#else
+              << " lto=off\n";
+#endif
 
 #ifndef XENDIZA_BENCH_WITH_ZYDIS
     std::cout << "Zydis comparison unavailable (build with -DXENDIZA_BENCH_WITH_ZYDIS=ON)\n";
@@ -359,28 +431,49 @@ int main(int argc, char** argv)
     std::cout << "Decoder        | Throughput |    Decode | Stats\n";
     std::cout << "---------------------------------------------------------------\n";
 
-    Result x_result;
-    x_result.name = "xendiza";
-    x_result.best_seconds = TimeXendiza(corpus, is_64bit, opt.warmup, opt.inner_iters, opt.samples,
-                                        x_result.decoded, x_result.checksum);
-    x_result.bytes_processed = static_cast<uint64_t>(corpus.size()) * opt.inner_iters;
-    x_result.errors = 0;
-    PrintResult(x_result);
+    Result x_length_result;
+    x_length_result.name = "xendiza-length";
+    x_length_result.best_seconds = TimeXendiza<false>(
+        corpus, is_64bit, opt.warmup, opt.inner_iters, opt.samples,
+        x_length_result.decoded, x_length_result.checksum);
+    x_length_result.bytes_processed = static_cast<uint64_t>(corpus.size()) * opt.inner_iters;
+    x_length_result.errors = 0;
+    PrintResult(x_length_result);
+
+    Result x_full_result;
+    x_full_result.name = "xendiza-full";
+    x_full_result.best_seconds = TimeXendiza<true>(
+        corpus, is_64bit, opt.warmup, opt.inner_iters, opt.samples,
+        x_full_result.decoded, x_full_result.checksum);
+    x_full_result.bytes_processed = static_cast<uint64_t>(corpus.size()) * opt.inner_iters;
+    x_full_result.errors = 0;
+    PrintResult(x_full_result);
+
+    Result floor_result;
+    floor_result.name = "empty-floor";
+    floor_result.best_seconds = TimeEmptyFloor(
+        corpus.size(), x_lengths, opt.warmup, opt.inner_iters, opt.samples,
+        floor_result.decoded, floor_result.checksum);
+    floor_result.bytes_processed = static_cast<uint64_t>(corpus.size()) * opt.inner_iters;
+    floor_result.errors = 0;
+    PrintResult(floor_result);
 
     Result z_result;
-    z_result.name = "zydis";
+    z_result.name = "zydis-length";
     z_result.best_seconds = TimeZydis(corpus, is_64bit, opt.warmup, opt.inner_iters, opt.samples,
                                       z_result.decoded, z_result.checksum);
     z_result.bytes_processed = static_cast<uint64_t>(corpus.size()) * opt.inner_iters;
     z_result.errors = 0;
     PrintResult(z_result);
 
-    // Throughput ratio = (bytes/x_seconds) / (bytes/z_seconds) = z_seconds / x_seconds.
-    const double ratio = (x_result.best_seconds > 0.0)
-        ? (z_result.best_seconds / x_result.best_seconds)
+    // Keep the historical comparison on the length-only metric. The full
+    // variant deliberately includes consumption of all xendiza metadata.
+    const double ratio = (x_length_result.best_seconds > 0.0)
+        ? (z_result.best_seconds / x_length_result.best_seconds)
         : 0.0;
-    std::cout << "xendiza/Zydis throughput ratio: "
+    std::cout << "xendiza-length/Zydis throughput ratio: "
               << std::fixed << std::setprecision(3) << ratio << "\n";
+    std::cout << "(empty-floor replays precomputed lengths; it is a measurement floor, not a target)\n";
     std::cout << "(xendiza returns abstract opcode/operand classes; Zydis performs fuller semantic decoding)\n";
 
     return 0;

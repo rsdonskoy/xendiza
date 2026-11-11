@@ -44,23 +44,24 @@ def run_bench(bench: Path, isa: str) -> dict:
 
     for raw in out.splitlines():
         line = raw.strip()
-        if line.startswith("xendiza") and "|" in line:
-            parts = line.split("|")
-            result["xendiza"] = {
-                "throughput": parts[1].strip() if len(parts) > 1 else "",
-                "decoded": int(re.search(r"decoded=(\d+)", line).group(1)),
-                "errors": int(re.search(r"errors=(\d+)", line).group(1)),
-                "checksum": int(re.search(r"checksum=(\d+)", line).group(1)),
-            }
-        elif line.startswith("zydis") and "|" in line:
-            parts = line.split("|")
-            result["zydis"] = {
-                "throughput": parts[1].strip() if len(parts) > 1 else "",
-                "decoded": int(re.search(r"decoded=(\d+)", line).group(1)),
-                "errors": int(re.search(r"errors=(\d+)", line).group(1)),
-                "checksum": int(re.search(r"checksum=(\d+)", line).group(1)),
-            }
-        elif "throughput ratio" in line:
+        matched = False
+        for prefix, key in (
+            ("xendiza-length", "xendiza_length"),
+            ("xendiza-full", "xendiza_full"),
+            ("empty-floor", "empty_floor"),
+            ("zydis-length", "zydis"),
+        ):
+            if line.startswith(prefix) and "|" in line:
+                parts = line.split("|")
+                result[key] = {
+                    "throughput": parts[1].strip() if len(parts) > 1 else "",
+                    "decoded": int(re.search(r"decoded=(\d+)", line).group(1)),
+                    "errors": int(re.search(r"errors=(\d+)", line).group(1)),
+                    "checksum": int(re.search(r"checksum=(\d+)", line).group(1)),
+                }
+                matched = True
+                break
+        if not matched and "throughput ratio" in line:
             result["ratio"] = float(re.search(r"ratio:\s*([0-9.]+)", line).group(1))
     return result
 
@@ -87,23 +88,29 @@ def main() -> int:
             print(f"SKIP {isa}: Zydis comparison unavailable")
             continue
 
-        if r["xendiza"]["errors"] != 0 or r["zydis"]["errors"] != 0:
+        timed = (r["xendiza_length"], r["xendiza_full"], r["empty_floor"], r["zydis"])
+        if any(row["errors"] != 0 for row in timed):
             print(f"FAIL {isa}: benchmark reported errors")
             errors += 1
             continue
-        if r["xendiza"]["decoded"] != r["zydis"]["decoded"]:
+        if any(row["decoded"] != r["zydis"]["decoded"] for row in timed):
             print(f"FAIL {isa}: decoded counts differ")
             errors += 1
             continue
-        if r["xendiza"]["checksum"] != r["zydis"]["checksum"]:
-            print(f"FAIL {isa}: checksums differ")
+        if (r["xendiza_length"]["checksum"] != r["zydis"]["checksum"]
+                or r["empty_floor"]["checksum"] != r["zydis"]["checksum"]):
+            print(f"FAIL {isa}: length checksums differ")
+            errors += 1
+            continue
+        if r["xendiza_full"]["checksum"] == r["zydis"]["checksum"]:
+            print(f"FAIL {isa}: full-metadata checksum did not consume additional fields")
             errors += 1
             continue
         if r["ratio"] <= 0.0:
             print(f"FAIL {isa}: throughput ratio must be positive")
             errors += 1
             continue
-        print(f"PASS {isa}: decoded={r['xendiza']['decoded']} ratio={r['ratio']:.3f}")
+        print(f"PASS {isa}: decoded={r['zydis']['decoded']} ratio={r['ratio']:.3f}")
 
     return 1 if errors else 0
 
