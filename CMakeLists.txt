@@ -39,6 +39,9 @@ target_link_libraries(xendiza PUBLIC Microsoft.GSL::GSL)
 
 if(MSVC)
     target_compile_options(xendiza PRIVATE /Zc:preprocessor)
+    # The compile-time VEX variant expansion evaluates a few million constexpr
+    # steps; raise the MSVC step budget so the table generation stays constexpr.
+    target_compile_options(xendiza PRIVATE /constexpr:steps209715200)
 endif()
 
 # Tests
@@ -80,6 +83,7 @@ add_executable(xendiza_tests
     test/test_vex_avx_a3.cpp
     test/test_vex_avx_forms.cpp
     test/test_vex_direct_dispatch.cpp
+    test/test_vex_variant_decode.cpp
 )
 
 target_link_libraries(xendiza_tests PRIVATE xendiza GTest::gtest GTest::gtest_main)
@@ -90,6 +94,22 @@ endif()
 
 include(GoogleTest)
 gtest_discover_tests(xendiza_tests)
+
+# Expansion tests need raw descriptor access. Compile the implementation into
+# this test-only target instead of retaining the source descriptors and test
+# accessors in the production library and its benchmark consumers.
+add_executable(xendiza_vex_variant_tests
+    src/vex_decode.cpp
+    test/test_vex_variant_expansion.cpp
+    test/test_vex_variant_focused.cpp
+)
+target_compile_definitions(xendiza_vex_variant_tests PRIVATE XENDIZA_VEX_VARIANT_TEST_ACCESS=1)
+target_include_directories(xendiza_vex_variant_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(xendiza_vex_variant_tests PRIVATE Microsoft.GSL::GSL GTest::gtest GTest::gtest_main)
+if(MSVC)
+    target_compile_options(xendiza_vex_variant_tests PRIVATE /Zc:preprocessor /constexpr:steps209715200)
+endif()
+gtest_discover_tests(xendiza_vex_variant_tests)
 
 # Example
 add_executable(xendiza_example

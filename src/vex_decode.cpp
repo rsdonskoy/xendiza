@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 namespace xendiza::detail {
@@ -1244,17 +1245,273 @@ constexpr auto kVexMap_0F3A = [] {
     return table;
 }();
 
-constexpr auto GetDescriptor(const uint8_t map, const uint8_t opcode, const uint8_t pp) noexcept
-    -> const std::optional<VexDescriptor>*
+// Descriptor lookup for the decoder goes through the flat precomputed variant
+// index (VexLookupVariantDescriptor below); the map tables above feed only the
+// compile-time expansion and the raw-descriptor test accessors.
+
+// ---- Compile-time descriptor expansion -------------------------------------
+//
+// Every present descriptor is expanded into sixteen variant slots indexed by
+//   variant = L<<3 | W<<2 | register_form<<1 | (vvvv == 0xF).
+// The expansion applies exactly the precedence the production selector used:
+//   1. Reject disallowed L and W values.
+//   2. Prefer a per-W form; otherwise select the per-L form.
+//   3. Apply the LIG fallback only when L=1, an L=0 form exists, and no L=1
+//      ModR/M.reg group exists.
+//   4. Resolve register versus memory shape and the corresponding operand
+//      pattern, memory-opcode override, and W-dependent opcode override.
+//   5. Apply the descriptor-wide and register/memory-specific vvvv rules.
+//   6. Fold W/L-dependent gather operand patterns into the resolved form.
+// Invalid slots never acquire a resolved form.  Duplicate resolved forms are
+// interned into one shared pool so WIG/LIG/shared reg-mem forms stay cheap.
+
+constexpr size_t kVexFlatStride = 256 * 4;
+
+// Mirrors the pre-change form selection precedence.
+constexpr auto SelectBaseForm(const VexDescriptor& d, const uint8_t L, const uint8_t W) noexcept
+    -> const VexOpForm*
 {
-    if (pp > 3) return nullptr;
-    const VexMapTable* table = nullptr;
-    if (map == 0x01) table = &kVexMap_0F;
-    else if (map == 0x02) table = &kVexMap_0F38;
-    else if (map == 0x03) table = &kVexMap_0F3A;
-    else return nullptr;
-    return &(*table)[opcode][pp];
+    if (d.forms_by_W[W].has_value()) return &d.forms_by_W[W].value();
+    if (d.forms_by_L[L].has_value()) return &d.forms_by_L[L].value();
+    if (L == 1 && d.forms_by_L[0].has_value() && d.forms_by_reg[1] == nullptr) {
+        // LIG: L=1 reuses the L=0 form when the descriptor explicitly allows it.
+        return &d.forms_by_L[0].value();
+    }
+    return nullptr;
 }
+
+// Mirrors the pre-change vvvv policy.  Form-aware overrides apply only to
+// forms that actually read a ModR/M byte (modrm_aware).
+constexpr auto VvvvPolicyOk(const VexDescriptor& d, const bool is_reg, const bool reserved,
+                            const bool modrm_aware) noexcept -> bool
+{
+    bool require_nonreserved = d.vvvv_required;
+    bool require_reserved = !d.vvvv_required && d.vvvv_reserved;
+    if (modrm_aware) {
+        if (is_reg && d.reg_vvvv_required) {
+            require_nonreserved = true;
+            require_reserved = false;
+        }
+        if (!is_reg && d.mem_vvvv_reserved) {
+            require_nonreserved = false;
+            require_reserved = true;
+        }
+    }
+    if (require_nonreserved && reserved) return false;
+    if (require_reserved && !reserved) return false;
+    return true;
+}
+
+constexpr auto ResolveOperands(const VexDescriptor& d, const VexOpForm& f,
+                               const uint8_t L, const uint8_t W, const bool is_reg) noexcept
+    -> VexResolvedForm
+{
+    VexResolvedForm r{};
+    r.trailing_size = f.trailing_size;
+    r.trailing_role = f.trailing_role;
+    r.allowed_modes = f.allowed_modes;
+    if (d.uses_vsib && d.gather_operands_valid[W][L]) {
+        // Gather forms use their own per-(W, L) architectural pattern:
+        // destination, VSIB memory, mask.
+        r.opcode = d.opcode_by_W[W];
+        const auto& g = d.gather_operands[W][L];
+        r.operands = { g[0], g[1], g[2], Operand::noopr };
+        r.operand_count = 3;
+        return r;
+    }
+    r.opcode = d.opcode_by_W[W] != OpcodeId::INVALID_OPCODE ? d.opcode_by_W[W]
+        : (!is_reg && f.mem_opcode != OpcodeId::INVALID_OPCODE) ? f.mem_opcode
+        : f.opcode;
+    if (is_reg) {
+        r.operands = f.operands;
+        r.operand_count = f.operand_count;
+    } else {
+        r.operands = f.mem_operands;
+        r.operand_count = f.mem_operand_count;
+        if (d.uses_vsib) {
+            for (auto& op : r.operands) {
+                if (op == Operand::m) op = d.vsib_op[W];
+            }
+        }
+    }
+    return r;
+}
+
+constexpr auto IsNoModrmDescriptor(const VexDescriptor& d) noexcept -> bool
+{
+    for (const auto& f : d.forms_by_L) {
+        if (f.has_value() && f->shape == VexModrmShape::None) return true;
+    }
+    for (const auto& f : d.forms_by_W) {
+        if (f.has_value() && f->shape == VexModrmShape::None) return true;
+    }
+    return false;
+}
+
+constexpr auto CountDescriptors() noexcept -> size_t
+{
+    size_t n = 0;
+    for (const auto* table : { &kVexMap_0F, &kVexMap_0F38, &kVexMap_0F3A }) {
+        for (const auto& row : *table) {
+            for (const auto& d : row) {
+                if (d.has_value()) ++n;
+            }
+        }
+    }
+    return n;
+}
+
+constexpr size_t kDescriptorCount = CountDescriptors();
+constexpr size_t kVariantSlotCount = kDescriptorCount * 16;
+
+struct FormPool {
+    std::array<VexResolvedForm, kVariantSlotCount> storage{};
+    uint16_t count = 0;
+
+    constexpr auto Intern(const VexResolvedForm& f) -> uint16_t
+    {
+        // Cheap first-field rejection keeps constexpr evaluation well inside
+        // the compiler step budget; full compares are rare after it.
+        for (uint16_t i = 0; i < count; ++i) {
+            if (storage[i].opcode == f.opcode && storage[i] == f) return i;
+        }
+        storage[count] = f;
+        return count++;
+    }
+};
+
+constexpr auto BuildVariantTables() noexcept
+{
+    struct Tables {
+        std::array<uint16_t, 3 * kVexFlatStride> flat{};  // descriptor ordinal + 1, 0 = absent.
+        std::array<VexVariantDescriptor, kDescriptorCount> records{};
+        std::array<uint16_t, kVariantSlotCount> slots{};
+        FormPool pool{};
+    };
+    Tables t{};
+    const VexMapTable* tables[3] = { &kVexMap_0F, &kVexMap_0F38, &kVexMap_0F3A };
+    uint16_t ordinal = 0;
+    for (uint8_t map = 1; map <= 3; ++map) {
+        const auto& table = *tables[map - 1];
+        for (uint16_t opcode = 0; opcode < 256; ++opcode) {
+            for (uint8_t pp = 0; pp < 4; ++pp) {
+                const auto& opt = table[opcode][pp];
+                if (!opt.has_value()) continue;
+                const auto& d = opt.value();
+                auto& rec = t.records[ordinal];
+                rec.variant_base = static_cast<uint16_t>(ordinal * 16);
+                rec.field_mask = static_cast<uint8_t>(
+                    ((d.allowed_L & 1u) && (d.allowed_W & 1u) ? 0x01u : 0u)
+                    | ((d.allowed_L & 1u) && (d.allowed_W & 2u) ? 0x02u : 0u)
+                    | ((d.allowed_L & 2u) && (d.allowed_W & 1u) ? 0x04u : 0u)
+                    | ((d.allowed_L & 2u) && (d.allowed_W & 2u) ? 0x08u : 0u));
+                const bool no_modrm = IsNoModrmDescriptor(d);
+                const bool group = d.forms_by_reg[0] != nullptr || d.forms_by_reg[1] != nullptr;
+                rec.flags = static_cast<uint8_t>(
+                    (no_modrm ? VexVariantNoModrm : 0) | (group ? VexVariantGroup : 0)
+                    | (d.uses_vsib ? VexVariantVsib : 0));
+                rec.group_forms = d.forms_by_reg;
+
+                for (uint8_t L = 0; L < 2; ++L) {
+                    for (uint8_t W = 0; W < 2; ++W) {
+                        for (uint8_t reg = 0; reg < 2; ++reg) {
+                            for (uint8_t reserved = 0; reserved < 2; ++reserved) {
+                                const uint8_t variant = static_cast<uint8_t>((L << 3) | (W << 2) | (reg << 1) | reserved);
+                                const bool lw_ok = (d.allowed_L & (1u << L)) != 0 && (d.allowed_W & (1u << W)) != 0;
+                                bool valid = lw_ok;
+                                uint16_t slot = kVexInvalidFormIndex;
+                                if (valid && group) {
+                                    // Group descriptors keep ModR/M.reg selection dynamic;
+                                    // the variant only carries (L, W) and the vvvv policy.
+                                    // An allowed L without a sub-table has no form at all.
+                                    valid = d.forms_by_reg[L] != nullptr
+                                        && VvvvPolicyOk(d, reg != 0, reserved != 0, true);
+                                } else if (valid) {
+                                    const VexOpForm* f = SelectBaseForm(d, L, W);
+                                    if (f == nullptr) {
+                                        valid = false;
+                                    } else {
+                                        const bool modrm_aware = f->shape != VexModrmShape::None;
+                                        if (f->shape == VexModrmShape::Reg && reg == 0) valid = false;
+                                        if (f->shape == VexModrmShape::Mem && reg == 1) valid = false;
+                                        // No-ModR/M forms use the canonical register-side value.
+                                        if (f->shape == VexModrmShape::None && reg == 0) valid = false;
+                                        if (valid && !VvvvPolicyOk(d, reg != 0, reserved != 0, modrm_aware)) {
+                                            valid = false;
+                                        }
+                                        if (valid) {
+                                            slot = t.pool.Intern(ResolveOperands(d, *f, L, W, reg != 0));
+                                        }
+                                    }
+                                }
+                                if (valid) rec.valid_mask |= static_cast<uint16_t>(1u << variant);
+                                t.slots[rec.variant_base + variant] = slot;
+                            }
+                        }
+                    }
+                }
+                t.flat[(map - 1) * kVexFlatStride + opcode * 4 + pp] = static_cast<uint16_t>(ordinal + 1);
+                ++ordinal;
+            }
+        }
+    }
+    return t;
+}
+
+constexpr size_t kResolvedFormCount = BuildVariantTables().pool.count;
+
+// Do not retain BuildVariantTables' maximum-capacity FormPool in runtime
+// storage.  The expanded tables are a compile-time temporary; only their flat
+// index, records, slots, and the compacted form pool are emitted.
+template <size_t N>
+struct VexRuntimeTables {
+    std::array<uint16_t, 3 * kVexFlatStride> flat;
+    std::array<VexVariantDescriptor, kDescriptorCount> records;
+    std::array<uint16_t, kVariantSlotCount> slots;
+    std::array<VexResolvedForm, N> forms;
+};
+
+template <size_t N>
+constexpr auto CompactVariantTables() noexcept
+{
+    const auto expanded = BuildVariantTables();
+    VexRuntimeTables<N> out{ expanded.flat, expanded.records, expanded.slots, {} };
+    for (size_t i = 0; i < N; ++i) out.forms[i] = expanded.pool.storage[i];
+    return out;
+}
+
+constexpr auto kVariantTables = CompactVariantTables<kResolvedFormCount>();
+
+#ifdef XENDIZA_VEX_VARIANT_TEST_ACCESS
+constexpr auto kRawDescriptorRefs = [] {
+    std::array<VexRawDescriptorRef, kDescriptorCount> refs{};
+    const VexMapTable* tables[3] = { &kVexMap_0F, &kVexMap_0F38, &kVexMap_0F3A };
+    uint16_t ordinal = 0;
+    for (uint8_t map = 1; map <= 3; ++map) {
+        const auto& table = *tables[map - 1];
+        for (uint16_t opcode = 0; opcode < 256; ++opcode) {
+            for (uint8_t pp = 0; pp < 4; ++pp) {
+                const auto& opt = table[opcode][pp];
+                if (!opt.has_value()) continue;
+                refs[ordinal++] = VexRawDescriptorRef{ map, static_cast<uint8_t>(opcode), pp, &opt.value() };
+            }
+        }
+    }
+    return refs;
+}();
+#endif
+
+static_assert(kDescriptorCount > 0 && kDescriptorCount < kVexInvalidFormIndex,
+              "flat index reserves 0; descriptor ordinals must fit in uint16_t");
+static_assert(kResolvedFormCount > 0 && kResolvedFormCount <= kVariantSlotCount
+              && kResolvedFormCount < kVexInvalidFormIndex,
+              "resolved-form pool indices must fit in uint16_t");
+static_assert(kVariantSlotCount <= kVexInvalidFormIndex,
+              "variant slot indices must fit in uint16_t");
+static_assert(std::is_trivially_copyable_v<VexResolvedForm>);
+static_assert(std::is_trivially_copyable_v<VexVariantDescriptor>);
+static_assert(sizeof(VexResolvedForm) == 14, "resolved-form record layout is fixed");
+static_assert(sizeof(VexVariantDescriptor) == 24, "variant descriptor record layout is fixed");
 
 constexpr auto ModrmNeedsSib(const uint8_t modrm) noexcept -> bool
 {
@@ -1288,19 +1545,45 @@ constexpr auto ResolveSibForLength(const uint8_t modrm, const uint8_t sib, const
     return 0;
 }
 
-constexpr auto ResolveMemoryOperand(const Operand base, const uint8_t modrm, const uint8_t sib, const uint8_t addr_size) noexcept -> Operand
+} // namespace
+
+#ifdef XENDIZA_VEX_VARIANT_TEST_ACCESS
+auto VexRawDescriptors() noexcept -> gsl::span<const VexRawDescriptorRef>
 {
-    (void)modrm;
-    (void)sib;
-    (void)addr_size;
-    if (base == Operand::m128 || base == Operand::m256 || base == Operand::m32 || base == Operand::m64 ||
-        base == Operand::m32_vsib || base == Operand::m64_vsib || base == Operand::m128_vsib || base == Operand::m256_vsib) {
-        return base;
-    }
-    return base;
+    return gsl::span<const VexRawDescriptorRef>{ kRawDescriptorRefs.data(), kRawDescriptorRefs.size() };
 }
 
-} // namespace
+auto VexVariantDescriptors() noexcept -> gsl::span<const VexVariantDescriptor>
+{
+    return gsl::span<const VexVariantDescriptor>{ kVariantTables.records.data(), kVariantTables.records.size() };
+}
+
+auto VexVariantSlots() noexcept -> gsl::span<const uint16_t>
+{
+    return gsl::span<const uint16_t>{ kVariantTables.slots.data(), kVariantTables.slots.size() };
+}
+
+auto VexResolvedForms() noexcept -> gsl::span<const VexResolvedForm>
+{
+    return gsl::span<const VexResolvedForm>{ kVariantTables.forms.data(), kVariantTables.forms.size() };
+}
+#endif
+
+auto VexLookupVariantDescriptor(const uint8_t map, const uint8_t opcode, const uint8_t pp) noexcept
+    -> const VexVariantDescriptor*
+{
+    if (map < 1 || map > 3 || pp > 3) return nullptr;
+    const auto ordinal = kVariantTables.flat[(map - 1) * kVexFlatStride + opcode * 4 + pp];
+    return ordinal == 0 ? nullptr : &kVariantTables.records[ordinal - 1];
+}
+
+auto VexResolvedFormForVariant(const VexVariantDescriptor& desc, const uint8_t variant) noexcept
+    -> const VexResolvedForm*
+{
+    if ((desc.valid_mask & (1u << (variant & 0x0F))) == 0) return nullptr;
+    const auto slot = kVariantTables.slots[desc.variant_base + (variant & 0x0F)];
+    return slot == kVexInvalidFormIndex ? nullptr : &kVariantTables.forms[slot];
+}
 
 auto VexDecoder::Decode(gsl::span<const uint8_t> buffer, const VexInfo& info) noexcept -> DecodedInstruction
 {
@@ -1309,108 +1592,97 @@ auto VexDecoder::Decode(gsl::span<const uint8_t> buffer, const VexInfo& info) no
     }
 
     const uint8_t opcode = buffer[info.opcode_offset];
-    const auto desc_ptr = GetDescriptor(info.map, opcode, info.pp);
-    if (desc_ptr == nullptr || !desc_ptr->has_value()) {
+    const auto* rec = VexLookupVariantDescriptor(info.map, opcode, info.pp);
+    if (rec == nullptr) {
         return ERR_UNIMPLEMENTED_DISASM;
     }
-    const auto& desc = desc_ptr->value();
 
-    // Validate L.
-    const uint8_t L_bit = static_cast<uint8_t>(1u << info.L);
-    if ((desc.allowed_L & L_bit) == 0) {
+    // Validate the L/W field combination before touching any further byte;
+    // the precomputed field mask preserves the pre-change check order.
+    const uint8_t lw = static_cast<uint8_t>((info.L << 1) | info.W);
+    if ((rec->field_mask & (1u << lw)) == 0) {
         return ERR_UNDEFINED_INSTRUCTION;
     }
+    const bool reserved = info.vvvv == 0x0F;
 
-    // Validate W.
-    const uint8_t W_bit = static_cast<uint8_t>(1u << info.W);
-    if ((desc.allowed_W & W_bit) == 0) {
-        return ERR_UNDEFINED_INSTRUCTION;
-    }
-
-    const VexOpForm* form_ptr = nullptr;
-    if (desc.forms_by_W[info.W].has_value()) {
-        form_ptr = &desc.forms_by_W[info.W].value();
-    } else if (desc.forms_by_L[info.L].has_value()) {
-        form_ptr = &desc.forms_by_L[info.L].value();
-    } else if (info.L == 1 && desc.forms_by_L[0].has_value() && desc.forms_by_reg[1] == nullptr) {
-        // LIG: L=1 reuses the L=0 form when the descriptor explicitly allows it.
-        form_ptr = &desc.forms_by_L[0].value();
-    }
-
-    // No-ModR/M forms still need the descriptor-wide vvvv policy.
-    if (form_ptr != nullptr && form_ptr->shape == VexModrmShape::None) {
-        if ((form_ptr->allowed_modes & (info.is_64bit ? 0x02u : 0x01u)) == 0) {
+    // No-ModR/M forms resolve on the canonical register-side variant.
+    if ((rec->flags & VexVariantNoModrm) != 0) {
+        const uint8_t variant = static_cast<uint8_t>((info.L << 3) | (info.W << 2) | 0b10 | (reserved ? 1u : 0u));
+        const auto* form = VexResolvedFormForVariant(*rec, variant);
+        if (form == nullptr) {
             return ERR_UNDEFINED_INSTRUCTION;
         }
-        if (desc.vvvv_required && info.vvvv == 0x0F) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-        if (!desc.vvvv_required && desc.vvvv_reserved && info.vvvv != 0x0F) {
+        if ((form->allowed_modes & (info.is_64bit ? 0x02u : 0x01u)) == 0) {
             return ERR_UNDEFINED_INSTRUCTION;
         }
         const uint8_t len = static_cast<uint8_t>(info.prefix_length + info.vex_length + 1);
         if (len > MAX_INSTRUCTION_LENGTH) {
             return ERR_UNDEFINED_INSTRUCTION;
         }
-        return { len, { form_ptr->opcode, form_ptr->operand_count, form_ptr->operands } };
+        return { len, { form->opcode, form->operand_count, form->operands } };
     }
 
-    // Read ModR/M before selecting optional ModR/M.reg group forms.
+    // Read ModR/M: the register/memory side and the reserved-vvvv bit complete
+    // the four-bit variant index.
     const uint8_t modrm_offset = static_cast<uint8_t>(info.opcode_offset + 1);
     if (modrm_offset >= buffer.size()) {
         return ERR_INSUFFICIENT_BUFFER;
     }
     const uint8_t modrm = buffer[modrm_offset];
     const bool is_reg = (modrm & 0b11'000'000) == 0b11'000'000;
+    const uint8_t variant = static_cast<uint8_t>((info.L << 3) | (info.W << 2) | (is_reg ? 2u : 0u) | (reserved ? 1u : 0u));
+    if ((rec->valid_mask & (1u << variant)) == 0) {
+        return ERR_UNDEFINED_INSTRUCTION;
+    }
 
-    if (desc.forms_by_reg[info.L] != nullptr) {
-        const auto& group = (*desc.forms_by_reg[info.L])[(modrm >> 3) & 7];
-        if (!group.has_value()) {
+    // Resolve the concrete form.  Group descriptors keep ModR/M.reg entry
+    // selection dynamic behind the variant; common forms read the shared
+    // resolved-form pool directly.
+    VexResolvedForm group_form{};
+    const VexResolvedForm* form_ptr = nullptr;
+    if ((rec->flags & VexVariantGroup) != 0) {
+        const auto* group = rec->group_forms[info.L];
+        if (group == nullptr) {
             return ERR_UNDEFINED_INSTRUCTION;
         }
-        form_ptr = &group.value();
-    }
-    if (form_ptr == nullptr || (form_ptr->allowed_modes & (info.is_64bit ? 0x02u : 0x01u)) == 0) {
-        return ERR_UNDEFINED_INSTRUCTION;
+        const auto& entry = (*group)[(modrm >> 3) & 7];
+        if (!entry.has_value()) {
+            return ERR_UNDEFINED_INSTRUCTION;
+        }
+        const auto& src = entry.value();
+        if ((src.allowed_modes & (info.is_64bit ? 0x02u : 0x01u)) == 0) {
+            return ERR_UNDEFINED_INSTRUCTION;
+        }
+        if (src.shape == VexModrmShape::Reg && !is_reg) {
+            return ERR_UNDEFINED_INSTRUCTION;
+        }
+        if (src.shape == VexModrmShape::Mem && is_reg) {
+            return ERR_UNDEFINED_INSTRUCTION;
+        }
+        group_form.opcode = src.opcode;
+        group_form.operands = is_reg ? src.operands : src.mem_operands;
+        group_form.operand_count = is_reg ? src.operand_count : src.mem_operand_count;
+        group_form.trailing_size = src.trailing_size;
+        group_form.trailing_role = src.trailing_role;
+        group_form.allowed_modes = src.allowed_modes;
+        form_ptr = &group_form;
+    } else {
+        form_ptr = VexResolvedFormForVariant(*rec, variant);
+        if (form_ptr == nullptr) {
+            return ERR_UNDEFINED_INSTRUCTION;
+        }
+        if ((form_ptr->allowed_modes & (info.is_64bit ? 0x02u : 0x01u)) == 0) {
+            return ERR_UNDEFINED_INSTRUCTION;
+        }
     }
     const auto& form = *form_ptr;
-
-    if (form.shape == VexModrmShape::Reg && !is_reg) {
-        return ERR_UNDEFINED_INSTRUCTION;
-    }
-    if (form.shape == VexModrmShape::Mem && is_reg) {
-        return ERR_UNDEFINED_INSTRUCTION;
-    }
-
-    // Validate vvvv now that the register/memory form is known.  NDS forms require
-    // a valid inverted register (vvvv != 1111); non-NDS forms normally require the
-    // reserved value (vvvv == 1111).  Scalar moves are form-aware: register merge
-    // uses an NDS source while memory load/store requires the reserved value.
-    {
-        bool require_nonreserved = desc.vvvv_required;
-        bool require_reserved = !desc.vvvv_required && desc.vvvv_reserved;
-        if (is_reg && desc.reg_vvvv_required) {
-            require_nonreserved = true;
-            require_reserved = false;
-        }
-        if (!is_reg && desc.mem_vvvv_reserved) {
-            require_nonreserved = false;
-            require_reserved = true;
-        }
-        if (require_nonreserved && info.vvvv == 0x0F) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-        if (require_reserved && info.vvvv != 0x0F) {
-            return ERR_UNDEFINED_INSTRUCTION;
-        }
-    }
 
     uint8_t modrm_len = 0;
     uint8_t sib_extra = 0;
 
     if (is_reg) {
         modrm_len = 1;
-    } else if (desc.uses_vsib) {
+    } else if ((rec->flags & VexVariantVsib) != 0) {
         // VSIB forms require 32/64-bit addressing with SIB/VSIB present.
         if (info.addr_size == 16) {
             return ERR_UNDEFINED_INSTRUCTION;
@@ -1469,41 +1741,9 @@ auto VexDecoder::Decode(gsl::span<const uint8_t> buffer, const VexInfo& info) no
         return ERR_UNDEFINED_INSTRUCTION;
     }
 
-    // Select the operand pattern.
-    const bool use_mem = !is_reg && (form.shape == VexModrmShape::Mem || form.shape == VexModrmShape::Both);
-    const uint8_t active_count = use_mem ? form.mem_operand_count : form.operand_count;
-    auto operands = use_mem ? form.mem_operands : form.operands;
-
-    // Convert the memory pattern to the abstract memory operand.
-    if (use_mem) {
-        for (uint8_t i = 0; i < active_count; ++i) {
-            const auto op = operands[i];
-            if (op == Operand::m128 || op == Operand::m256 || op == Operand::m32 || op == Operand::m64 ||
-                op == Operand::m32_vsib || op == Operand::m64_vsib || op == Operand::m128_vsib || op == Operand::m256_vsib) {
-                operands[i] = ResolveMemoryOperand(op, modrm, 0, info.addr_size);
-            } else if (op == Operand::m && desc.uses_vsib) {
-                operands[i] = desc.vsib_op[info.W];
-            }
-        }
-    }
-
-    OpcodeId final_opcode = (use_mem && form.mem_opcode != OpcodeId::INVALID_OPCODE)
-        ? form.mem_opcode
-        : form.opcode;
-    if (desc.opcode_by_W[info.W] != OpcodeId::INVALID_OPCODE) {
-        final_opcode = desc.opcode_by_W[info.W];
-    }
-
-    // Gather forms use their own per-(W,L) operand pattern in architectural order:
-    // destination, VSIB memory, mask.
-    if (desc.uses_vsib && desc.gather_operands_valid[info.W][info.L]) {
-        const auto& gops = desc.gather_operands[info.W][info.L];
-        operands[0] = gops[0];
-        operands[1] = gops[1];
-        operands[2] = gops[2];
-    }
-
-    return { total_len, { final_opcode, active_count, operands } };
+    // The resolved form already carries the final opcode and the concrete
+    // operand pattern for this variant; no further per-form selection runs.
+    return { total_len, { form.opcode, form.operand_count, form.operands } };
 }
 
 } // namespace xendiza::detail
